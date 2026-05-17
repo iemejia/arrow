@@ -177,8 +177,9 @@ class ZSTDCodec : public Codec {
       output_buffer = &empty_buffer;
     }
 
-    ARROW_ASSIGN_OR_RAISE(auto dctx, CreateDCtx());
-    size_t ret = ZSTD_decompressDCtx(dctx.get(), output_buffer,
+    ARROW_RETURN_NOT_OK(EnsureDCtx());
+    ZSTD_DCtx_reset(dctx_.get(), ZSTD_reset_session_only);
+    size_t ret = ZSTD_decompressDCtx(dctx_.get(), output_buffer,
                                      static_cast<size_t>(output_buffer_len), input,
                                      static_cast<size_t>(input_len));
     if (ZSTD_isError(ret)) {
@@ -198,9 +199,10 @@ class ZSTDCodec : public Codec {
 
   Result<int64_t> Compress(int64_t input_len, const uint8_t* input,
                            int64_t output_buffer_len, uint8_t* output_buffer) override {
-    ARROW_ASSIGN_OR_RAISE(auto cctx, CreateCCtx());
+    ARROW_RETURN_NOT_OK(EnsureCCtx());
+    ZSTD_CCtx_reset(cctx_.get(), ZSTD_reset_session_only);
     size_t ret =
-        ZSTD_compress2(cctx.get(), output_buffer, static_cast<size_t>(output_buffer_len),
+        ZSTD_compress2(cctx_.get(), output_buffer, static_cast<size_t>(output_buffer_len),
                        input, static_cast<size_t>(input_len));
     if (ZSTD_isError(ret)) {
       return ZSTDError(ret, "ZSTD compression failed: ");
@@ -226,6 +228,24 @@ class ZSTDCodec : public Codec {
   int compression_level() const override { return compression_level_; }
 
  private:
+  // Lazily initialize the cached compression context on first use.
+  // Subsequent calls to Compress() reuse this context with session-only reset,
+  // avoiding the overhead of ZSTD_createCCtx() + ZSTD_freeCCtx() per call.
+  Status EnsureCCtx() {
+    if (!cctx_) {
+      ARROW_ASSIGN_OR_RAISE(cctx_, CreateCCtx());
+    }
+    return Status::OK();
+  }
+
+  // Lazily initialize the cached decompression context on first use.
+  Status EnsureDCtx() {
+    if (!dctx_) {
+      ARROW_ASSIGN_OR_RAISE(dctx_, CreateDCtx());
+    }
+    return Status::OK();
+  }
+
   Result<CCtxPtr> CreateCCtx() const {
     CCtxPtr cctx{ZSTD_createCCtx(), ZSTD_freeCCtx};
     if (cctx == nullptr) {
@@ -263,6 +283,12 @@ class ZSTDCodec : public Codec {
   const int compression_level_;
   const std::vector<std::pair<int, int>> compression_context_params_;
   const std::vector<std::pair<int, int>> decompression_context_params_;
+
+  // Cached contexts for one-shot Compress()/Decompress() — lazily initialized,
+  // reset via ZSTD_*Ctx_reset(ZSTD_reset_session_only) between calls to
+  // avoid repeated ZSTD_create*Ctx()/ZSTD_free*Ctx() allocations (~128KB+ each).
+  CCtxPtr cctx_{nullptr, ZSTD_freeCCtx};
+  DCtxPtr dctx_{nullptr, ZSTD_freeDCtx};
 };
 
 }  // namespace
