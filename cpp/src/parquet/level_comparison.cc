@@ -61,6 +61,17 @@ struct MinMaxDynamicFunction {
   }
 };
 
+struct MinMaxAndCountDynamicFunction {
+  using FunctionType = decltype(&FindMinMaxAndCount);
+
+  static constexpr auto targets() {
+    return std::array{
+        ARROW_DISPATCH_TARGET_NONE(&standard::FindMinMaxAndCountImpl)  //
+        ARROW_DISPATCH_TARGET_AVX2(&FindMinMaxAndCountAvx2)            //
+    };
+  }
+};
+
 }  // namespace
 
 uint64_t GreaterThanBitmap(const int16_t* levels, int64_t num_levels, int16_t rhs) {
@@ -71,6 +82,12 @@ uint64_t GreaterThanBitmap(const int16_t* levels, int64_t num_levels, int16_t rh
 MinMax FindMinMax(const int16_t* levels, int64_t num_levels) {
   static DynamicDispatch<MinMaxDynamicFunction> dispatch;
   return dispatch(levels, num_levels);
+}
+
+MinMaxCount FindMinMaxAndCount(const int16_t* levels, int64_t num_levels,
+                               int16_t target) {
+  static DynamicDispatch<MinMaxAndCountDynamicFunction> dispatch;
+  return dispatch(levels, num_levels, target);
 }
 
 }  // namespace parquet::internal

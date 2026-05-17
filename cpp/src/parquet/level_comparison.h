@@ -33,6 +33,18 @@ struct MinMax {
   int16_t max;
 };
 
+struct MinMaxCount {
+  int16_t min;
+  int16_t max;
+  int64_t count;  // count of values equal to a given target
+};
+
 MinMax FindMinMax(const int16_t* levels, int64_t num_levels);
+
+/// \brief Compute min, max, and count of values equal to \p target in a single pass.
+/// Used to fuse level validation (bounds check) with null counting
+/// (def_level == max_def_level).
+MinMaxCount PARQUET_EXPORT FindMinMaxAndCount(const int16_t* levels, int64_t num_levels,
+                                              int16_t target);
 
 }  // namespace parquet::internal
