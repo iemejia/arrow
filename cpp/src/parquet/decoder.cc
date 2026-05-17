@@ -1187,17 +1187,43 @@ int DictDecoderImpl<DType>::DecodeArrow(
 
   const auto* dict_values = dictionary_->data_as<typename DType::c_type>();
 
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        int32_t index;
-        if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
-          throw ParquetException("");
-        }
-        PARQUET_THROW_NOT_OK(IndexInBounds(index));
-        PARQUET_THROW_NOT_OK(builder->Append(dict_values[index]));
-      },
-      [&]() { PARQUET_THROW_NOT_OK(builder->AppendNull()); });
+  constexpr int32_t kBufferSize = 1024;
+  int32_t indices[kBufferSize];
+  const int values_to_decode = num_values - null_count;
+  int values_decoded = 0;
+  int num_indices = 0;
+  int pos_indices = 0;
+
+  PARQUET_THROW_NOT_OK(
+      VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                   [&](int64_t position, int64_t run_length, bool is_valid) {
+                     if (is_valid) {
+                       while (run_length > 0) {
+                         if (num_indices == pos_indices) {
+                           const auto batch_size = std::min<int32_t>(
+                               kBufferSize, values_to_decode - values_decoded);
+                           num_indices = idx_decoder_.GetBatch(indices, batch_size);
+                           if (ARROW_PREDICT_FALSE(num_indices < 1)) {
+                             return Status::Invalid("Invalid number of indices: ",
+                                                    num_indices);
+                           }
+                           pos_indices = 0;
+                         }
+                         const auto batch =
+                             std::min<int64_t>(num_indices - pos_indices, run_length);
+                         for (int64_t j = 0; j < batch; ++j) {
+                           const auto index = indices[pos_indices++];
+                           RETURN_NOT_OK(IndexInBounds(index));
+                           RETURN_NOT_OK(builder->Append(dict_values[index]));
+                         }
+                         values_decoded += static_cast<int32_t>(batch);
+                         run_length -= batch;
+                       }
+                     } else {
+                       RETURN_NOT_OK(builder->AppendNulls(run_length));
+                     }
+                     return Status::OK();
+                   }));
 
   return num_values - null_count;
 }
@@ -1222,22 +1248,43 @@ inline int DictDecoderImpl<FLBAType>::DecodeArrow(
   PARQUET_THROW_NOT_OK(builder->Reserve(num_values));
 
   const auto* dict_values = dictionary_->data_as<FLBA>();
+
+  constexpr int32_t kBufferSize = 1024;
+  int32_t indices[kBufferSize];
+  const int values_to_decode = num_values - null_count;
+  int values_decoded = 0;
+  int num_indices = 0;
+  int pos_indices = 0;
+
   PARQUET_THROW_NOT_OK(
       VisitBitRuns(valid_bits, valid_bits_offset, num_values,
                    [&](int64_t position, int64_t run_length, bool is_valid) {
                      if (is_valid) {
-                       for (int64_t i = 0; i < run_length; ++i) {
-                         int32_t index;
-                         if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
-                           return Status::Invalid("Dict decoding failed");
+                       while (run_length > 0) {
+                         if (num_indices == pos_indices) {
+                           const auto batch_size = std::min<int32_t>(
+                               kBufferSize, values_to_decode - values_decoded);
+                           num_indices = idx_decoder_.GetBatch(indices, batch_size);
+                           if (ARROW_PREDICT_FALSE(num_indices < 1)) {
+                             return Status::Invalid("Invalid number of indices: ",
+                                                    num_indices);
+                           }
+                           pos_indices = 0;
                          }
-                         RETURN_NOT_OK(IndexInBounds(index));
-                         builder->UnsafeAppend(dict_values[index].ptr);
+                         const auto batch =
+                             std::min<int64_t>(num_indices - pos_indices, run_length);
+                         for (int64_t j = 0; j < batch; ++j) {
+                           const auto index = indices[pos_indices++];
+                           RETURN_NOT_OK(IndexInBounds(index));
+                           builder->UnsafeAppend(dict_values[index].ptr);
+                         }
+                         values_decoded += static_cast<int32_t>(batch);
+                         run_length -= batch;
                        }
-                       return Status::OK();
                      } else {
-                       return builder->AppendNulls(run_length);
+                       RETURN_NOT_OK(builder->AppendNulls(run_length));
                      }
+                     return Status::OK();
                    }));
 
   return num_values - null_count;
@@ -1261,17 +1308,43 @@ int DictDecoderImpl<FLBAType>::DecodeArrow(
 
   const auto* dict_values = dictionary_->data_as<FLBA>();
 
-  VisitNullBitmapInline(
-      valid_bits, valid_bits_offset, num_values, null_count,
-      [&]() {
-        int32_t index;
-        if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
-          throw ParquetException("");
-        }
-        PARQUET_THROW_NOT_OK(IndexInBounds(index));
-        PARQUET_THROW_NOT_OK(builder->Append(dict_values[index].ptr));
-      },
-      [&]() { PARQUET_THROW_NOT_OK(builder->AppendNull()); });
+  constexpr int32_t kBufferSize = 1024;
+  int32_t indices[kBufferSize];
+  const int values_to_decode = num_values - null_count;
+  int values_decoded = 0;
+  int num_indices = 0;
+  int pos_indices = 0;
+
+  PARQUET_THROW_NOT_OK(
+      VisitBitRuns(valid_bits, valid_bits_offset, num_values,
+                   [&](int64_t position, int64_t run_length, bool is_valid) {
+                     if (is_valid) {
+                       while (run_length > 0) {
+                         if (num_indices == pos_indices) {
+                           const auto batch_size = std::min<int32_t>(
+                               kBufferSize, values_to_decode - values_decoded);
+                           num_indices = idx_decoder_.GetBatch(indices, batch_size);
+                           if (ARROW_PREDICT_FALSE(num_indices < 1)) {
+                             return Status::Invalid("Invalid number of indices: ",
+                                                    num_indices);
+                           }
+                           pos_indices = 0;
+                         }
+                         const auto batch =
+                             std::min<int64_t>(num_indices - pos_indices, run_length);
+                         for (int64_t j = 0; j < batch; ++j) {
+                           const auto index = indices[pos_indices++];
+                           RETURN_NOT_OK(IndexInBounds(index));
+                           RETURN_NOT_OK(builder->Append(dict_values[index].ptr));
+                         }
+                         values_decoded += static_cast<int32_t>(batch);
+                         run_length -= batch;
+                       }
+                     } else {
+                       RETURN_NOT_OK(builder->AppendNulls(run_length));
+                     }
+                     return Status::OK();
+                   }));
 
   return num_values - null_count;
 }
@@ -1285,22 +1358,42 @@ int DictDecoderImpl<Type>::DecodeArrow(
   using value_type = typename Type::c_type;
   const auto* dict_values = dictionary_->data_as<value_type>();
 
+  constexpr int32_t kBufferSize = 1024;
+  int32_t indices[kBufferSize];
+  const int values_to_decode = num_values - null_count;
+  int values_decoded = 0;
+  int num_indices = 0;
+  int pos_indices = 0;
+
   PARQUET_THROW_NOT_OK(
       VisitBitRuns(valid_bits, valid_bits_offset, num_values,
                    [&](int64_t position, int64_t run_length, bool is_valid) {
                      if (is_valid) {
-                       for (int64_t i = 0; i < run_length; ++i) {
-                         int32_t index;
-                         if (ARROW_PREDICT_FALSE(!idx_decoder_.Get(&index))) {
-                           return Status::Invalid("Dict decoding failed");
+                       while (run_length > 0) {
+                         if (num_indices == pos_indices) {
+                           const auto batch_size = std::min<int32_t>(
+                               kBufferSize, values_to_decode - values_decoded);
+                           num_indices = idx_decoder_.GetBatch(indices, batch_size);
+                           if (ARROW_PREDICT_FALSE(num_indices < 1)) {
+                             return Status::Invalid("Invalid number of indices: ",
+                                                    num_indices);
+                           }
+                           pos_indices = 0;
                          }
-                         RETURN_NOT_OK(IndexInBounds(index));
-                         builder->UnsafeAppend(dict_values[index]);
+                         const auto batch =
+                             std::min<int64_t>(num_indices - pos_indices, run_length);
+                         for (int64_t j = 0; j < batch; ++j) {
+                           const auto index = indices[pos_indices++];
+                           RETURN_NOT_OK(IndexInBounds(index));
+                           builder->UnsafeAppend(dict_values[index]);
+                         }
+                         values_decoded += static_cast<int32_t>(batch);
+                         run_length -= batch;
                        }
-                       return Status::OK();
                      } else {
-                       return builder->AppendNulls(run_length);
+                       RETURN_NOT_OK(builder->AppendNulls(run_length));
                      }
+                     return Status::OK();
                    }));
 
   return num_values - null_count;
