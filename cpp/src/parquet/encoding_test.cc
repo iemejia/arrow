@@ -2660,4 +2660,664 @@ TEST(DeltaByteArrayEncodingAdHoc, ArrowDirectPut) {
   }
 }
 
+// ----------------------------------------------------------------------
+// SkipValues tests for all decoder implementations.
+//
+// These tests directly exercise the Decoder::SkipValues() method for each
+// encoding type, verifying that skipping N values then decoding the rest
+// produces the same results as decoding all values and taking the suffix.
+
+// --- PLAIN encoding SkipValues ---
+
+template <typename Type>
+class TestPlainSkipValues : public TestEncodingBase<Type> {
+ public:
+  using c_type = typename Type::c_type;
+
+  void CheckRoundtrip() override {}
+
+  void CheckSkip(int skip_count) {
+    auto encoder =
+        MakeTypedEncoder<Type>(Encoding::PLAIN, /*use_dictionary=*/false, descr_.get());
+    auto decoder = MakeTypedDecoder<Type>(Encoding::PLAIN, descr_.get());
+    encoder->Put(draws_, num_values_);
+    encode_buffer_ = encoder->FlushValues();
+
+    decoder->SetData(num_values_, encode_buffer_->data(),
+                     static_cast<int>(encode_buffer_->size()));
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    int values_decoded = decoder->Decode(decode_buf_, remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(decode_buf_, draws_ + skip_count, remaining));
+  }
+
+ protected:
+  USING_BASE_MEMBERS();
+};
+
+TYPED_TEST_SUITE(TestPlainSkipValues, ParquetTypes);
+
+TYPED_TEST(TestPlainSkipValues, SkipNone) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(0));
+}
+
+TYPED_TEST(TestPlainSkipValues, SkipSome) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(137));
+}
+
+TYPED_TEST(TestPlainSkipValues, SkipAll) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(1000));
+}
+
+TYPED_TEST(TestPlainSkipValues, SkipThenDecodeInBatches) {
+  this->InitData(1000, 1);
+  auto encoder = MakeTypedEncoder<TypeParam>(Encoding::PLAIN, /*use_dictionary=*/false,
+                                             this->descr_.get());
+  auto decoder = MakeTypedDecoder<TypeParam>(Encoding::PLAIN, this->descr_.get());
+  encoder->Put(this->draws_, this->num_values_);
+  this->encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(this->num_values_, this->encode_buffer_->data(),
+                   static_cast<int>(this->encode_buffer_->size()));
+  int skip = 200;
+  decoder->SkipValues(skip);
+  // Decode in small batches
+  int offset = skip;
+  int batch = 131;
+  while (offset < this->num_values_) {
+    int to_decode = std::min(batch, this->num_values_ - offset);
+    int decoded = decoder->Decode(this->decode_buf_, to_decode);
+    ASSERT_EQ(to_decode, decoded);
+    ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+        this->decode_buf_, this->draws_ + offset, decoded));
+    offset += decoded;
+  }
+}
+
+TYPED_TEST(TestPlainSkipValues, InterleavedSkipAndDecode) {
+  this->InitData(1000, 1);
+  auto encoder = MakeTypedEncoder<TypeParam>(Encoding::PLAIN, /*use_dictionary=*/false,
+                                             this->descr_.get());
+  auto decoder = MakeTypedDecoder<TypeParam>(Encoding::PLAIN, this->descr_.get());
+  encoder->Put(this->draws_, this->num_values_);
+  this->encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(this->num_values_, this->encode_buffer_->data(),
+                   static_cast<int>(this->encode_buffer_->size()));
+  // Skip 100, decode 200, skip 300, decode rest
+  decoder->SkipValues(100);
+  int decoded = decoder->Decode(this->decode_buf_, 200);
+  ASSERT_EQ(200, decoded);
+  ASSERT_NO_FATAL_FAILURE(
+      VerifyResults<typename TypeParam::c_type>(this->decode_buf_, this->draws_ + 100, 200));
+
+  decoder->SkipValues(300);
+  int remaining = this->num_values_ - 600;
+  decoded = decoder->Decode(this->decode_buf_, remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 600, remaining));
+}
+
+// --- Dictionary encoding SkipValues ---
+
+template <typename Type>
+class TestDictionarySkipValues : public TestEncodingBase<Type> {
+ public:
+  using c_type = typename Type::c_type;
+
+  void CheckRoundtrip() override {}
+
+  void CheckSkip(int skip_count) {
+    auto base_encoder =
+        MakeEncoder(Type::type_num, Encoding::PLAIN, true, descr_.get());
+    auto encoder =
+        dynamic_cast<typename EncodingTraits<Type>::Encoder*>(base_encoder.get());
+    auto dict_traits = dynamic_cast<DictEncoder<Type>*>(base_encoder.get());
+
+    encoder->Put(draws_, num_values_);
+    dict_buffer_ =
+        AllocateBuffer(default_memory_pool(), dict_traits->dict_encoded_size());
+    dict_traits->WriteDict(dict_buffer_->mutable_data());
+    std::shared_ptr<Buffer> indices = encoder->FlushValues();
+
+    auto dict_decoder = MakeTypedDecoder<Type>(Encoding::PLAIN, descr_.get());
+    dict_decoder->SetData(dict_traits->num_entries(), dict_buffer_->data(),
+                          static_cast<int>(dict_buffer_->size()));
+    auto decoder = MakeDictDecoder<Type>(descr_.get());
+    decoder->SetDict(dict_decoder.get());
+    decoder->SetData(num_values_, indices->data(), static_cast<int>(indices->size()));
+
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    int values_decoded = decoder->Decode(decode_buf_, remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(decode_buf_, draws_ + skip_count, remaining));
+  }
+
+ protected:
+  USING_BASE_MEMBERS();
+  std::shared_ptr<ResizableBuffer> dict_buffer_;
+};
+
+TYPED_TEST_SUITE(TestDictionarySkipValues, DictEncodedTypes);
+
+TYPED_TEST(TestDictionarySkipValues, SkipNone) {
+  this->InitData(2500, 2);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(0));
+}
+
+TYPED_TEST(TestDictionarySkipValues, SkipSome) {
+  this->InitData(2500, 2);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(1337));
+}
+
+TYPED_TEST(TestDictionarySkipValues, SkipAll) {
+  this->InitData(2500, 2);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(5000));
+}
+
+TYPED_TEST(TestDictionarySkipValues, InterleavedSkipAndDecode) {
+  this->InitData(2500, 2);
+  auto base_encoder =
+      MakeEncoder(TypeParam::type_num, Encoding::PLAIN, true, this->descr_.get());
+  auto encoder =
+      dynamic_cast<typename EncodingTraits<TypeParam>::Encoder*>(base_encoder.get());
+  auto dict_traits = dynamic_cast<DictEncoder<TypeParam>*>(base_encoder.get());
+
+  encoder->Put(this->draws_, this->num_values_);
+  this->dict_buffer_ =
+      AllocateBuffer(default_memory_pool(), dict_traits->dict_encoded_size());
+  dict_traits->WriteDict(this->dict_buffer_->mutable_data());
+  std::shared_ptr<Buffer> indices = encoder->FlushValues();
+
+  auto dict_decoder = MakeTypedDecoder<TypeParam>(Encoding::PLAIN, this->descr_.get());
+  dict_decoder->SetData(dict_traits->num_entries(), this->dict_buffer_->data(),
+                        static_cast<int>(this->dict_buffer_->size()));
+  auto decoder = MakeDictDecoder<TypeParam>(this->descr_.get());
+  decoder->SetDict(dict_decoder.get());
+  decoder->SetData(this->num_values_, indices->data(),
+                   static_cast<int>(indices->size()));
+
+  // Skip 500, decode 1000, skip 1500, decode rest
+  decoder->SkipValues(500);
+  int decoded = decoder->Decode(this->decode_buf_, 1000);
+  ASSERT_EQ(1000, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 500, 1000));
+
+  decoder->SkipValues(1500);
+  int remaining = this->num_values_ - 3000;
+  decoded = decoder->Decode(this->decode_buf_, remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 3000, remaining));
+}
+
+// --- ByteStreamSplit encoding SkipValues ---
+
+template <typename Type>
+class TestByteStreamSplitSkipValues : public TestEncodingBase<Type> {
+ public:
+  using c_type = typename Type::c_type;
+
+  void CheckRoundtrip() override {}
+
+  void CheckSkip(int skip_count) {
+    auto encoder = MakeTypedEncoder<Type>(Encoding::BYTE_STREAM_SPLIT,
+                                          /*use_dictionary=*/false, descr_.get());
+    auto decoder = MakeTypedDecoder<Type>(Encoding::BYTE_STREAM_SPLIT, descr_.get());
+    encoder->Put(draws_, num_values_);
+    encode_buffer_ = encoder->FlushValues();
+
+    decoder->SetData(num_values_, encode_buffer_->data(),
+                     static_cast<int>(encode_buffer_->size()));
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    int values_decoded = decoder->Decode(decode_buf_, remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(decode_buf_, draws_ + skip_count, remaining));
+  }
+
+ protected:
+  USING_BASE_MEMBERS();
+};
+
+TYPED_TEST_SUITE(TestByteStreamSplitSkipValues, ByteStreamSplitTypes);
+
+TYPED_TEST(TestByteStreamSplitSkipValues, SkipNone) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(0));
+}
+
+TYPED_TEST(TestByteStreamSplitSkipValues, SkipSome) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(137));
+}
+
+TYPED_TEST(TestByteStreamSplitSkipValues, SkipAll) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(1000));
+}
+
+TYPED_TEST(TestByteStreamSplitSkipValues, InterleavedSkipAndDecode) {
+  this->InitData(1000, 1);
+  auto encoder = MakeTypedEncoder<TypeParam>(Encoding::BYTE_STREAM_SPLIT,
+                                             /*use_dictionary=*/false, this->descr_.get());
+  auto decoder =
+      MakeTypedDecoder<TypeParam>(Encoding::BYTE_STREAM_SPLIT, this->descr_.get());
+  encoder->Put(this->draws_, this->num_values_);
+  this->encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(this->num_values_, this->encode_buffer_->data(),
+                   static_cast<int>(this->encode_buffer_->size()));
+  decoder->SkipValues(100);
+  int decoded = decoder->Decode(this->decode_buf_, 200);
+  ASSERT_EQ(200, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 100, 200));
+
+  decoder->SkipValues(300);
+  int remaining = this->num_values_ - 600;
+  decoded = decoder->Decode(this->decode_buf_, remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 600, remaining));
+}
+
+// --- DeltaBitPack encoding SkipValues ---
+
+template <typename Type>
+class TestDeltaBitPackSkipValues : public TestEncodingBase<Type> {
+ public:
+  using c_type = typename Type::c_type;
+
+  void CheckRoundtrip() override {}
+
+  void CheckSkip(int skip_count) {
+    auto encoder = MakeTypedEncoder<Type>(Encoding::DELTA_BINARY_PACKED,
+                                          /*use_dictionary=*/false, descr_.get());
+    auto decoder = MakeTypedDecoder<Type>(Encoding::DELTA_BINARY_PACKED, descr_.get());
+    encoder->Put(draws_, num_values_);
+    encode_buffer_ = encoder->FlushValues();
+
+    decoder->SetData(num_values_, encode_buffer_->data(),
+                     static_cast<int>(encode_buffer_->size()));
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    std::vector<c_type> result(remaining);
+    int values_decoded = decoder->Decode(result.data(), remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(result.data(), draws_ + skip_count, remaining));
+  }
+
+ protected:
+  USING_BASE_MEMBERS();
+};
+
+using TestDeltaBitPackSkipTypes = ::testing::Types<Int32Type, Int64Type>;
+TYPED_TEST_SUITE(TestDeltaBitPackSkipValues, TestDeltaBitPackSkipTypes);
+
+TYPED_TEST(TestDeltaBitPackSkipValues, SkipNone) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(0));
+}
+
+TYPED_TEST(TestDeltaBitPackSkipValues, SkipSome) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(137));
+}
+
+TYPED_TEST(TestDeltaBitPackSkipValues, SkipAll) {
+  this->InitData(1000, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(1000));
+}
+
+TYPED_TEST(TestDeltaBitPackSkipValues, SkipAcrossBlocks) {
+  // DeltaBitPack uses blocks of 128 values and miniblocks of 32 values.
+  // Test skipping across these boundaries.
+  this->InitData(1000, 1);
+  // Skip past first block (128 values)
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(128));
+  // Skip to middle of second block
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(200));
+  // Skip multiple blocks
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(512));
+}
+
+TYPED_TEST(TestDeltaBitPackSkipValues, InterleavedSkipAndDecode) {
+  this->InitData(1000, 1);
+  auto encoder = MakeTypedEncoder<TypeParam>(Encoding::DELTA_BINARY_PACKED,
+                                             /*use_dictionary=*/false, this->descr_.get());
+  auto decoder =
+      MakeTypedDecoder<TypeParam>(Encoding::DELTA_BINARY_PACKED, this->descr_.get());
+  encoder->Put(this->draws_, this->num_values_);
+  this->encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(this->num_values_, this->encode_buffer_->data(),
+                   static_cast<int>(this->encode_buffer_->size()));
+  // Skip 100, decode 200, skip 300, decode rest
+  decoder->SkipValues(100);
+  std::vector<typename TypeParam::c_type> result(this->num_values_);
+  int decoded = decoder->Decode(result.data(), 200);
+  ASSERT_EQ(200, decoded);
+  ASSERT_NO_FATAL_FAILURE(
+      VerifyResults<typename TypeParam::c_type>(result.data(), this->draws_ + 100, 200));
+
+  decoder->SkipValues(300);
+  int remaining = this->num_values_ - 600;
+  decoded = decoder->Decode(result.data(), remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      result.data(), this->draws_ + 600, remaining));
+}
+
+// --- DeltaLengthByteArray encoding SkipValues ---
+
+template <typename Type>
+class TestDeltaLengthByteArraySkipValues : public TestEncodingBase<Type> {
+ public:
+  using c_type = typename Type::c_type;
+
+  void CheckRoundtrip() override {}
+
+  virtual Encoding::type GetEncoding() { return Encoding::DELTA_LENGTH_BYTE_ARRAY; }
+
+  void CheckSkip(int skip_count) {
+    auto encoding = GetEncoding();
+    auto encoder = MakeTypedEncoder<Type>(encoding, /*use_dictionary=*/false,
+                                          descr_.get());
+    auto decoder = MakeTypedDecoder<Type>(encoding, descr_.get());
+
+    encoder->Put(draws_, num_values_);
+    encode_buffer_ = encoder->FlushValues();
+
+    decoder->SetData(num_values_, encode_buffer_->data(),
+                     static_cast<int>(encode_buffer_->size()));
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    int values_decoded = decoder->Decode(decode_buf_, remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(decode_buf_, draws_ + skip_count, remaining));
+  }
+
+ protected:
+  USING_BASE_MEMBERS();
+};
+
+typedef ::testing::Types<ByteArrayType> TestDeltaLengthByteArraySkipTypes;
+TYPED_TEST_SUITE(TestDeltaLengthByteArraySkipValues, TestDeltaLengthByteArraySkipTypes);
+
+TYPED_TEST(TestDeltaLengthByteArraySkipValues, SkipNone) {
+  this->InitData(500, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(0));
+}
+
+TYPED_TEST(TestDeltaLengthByteArraySkipValues, SkipSome) {
+  this->InitData(500, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(137));
+}
+
+TYPED_TEST(TestDeltaLengthByteArraySkipValues, SkipAll) {
+  this->InitData(500, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(500));
+}
+
+TYPED_TEST(TestDeltaLengthByteArraySkipValues, InterleavedSkipAndDecode) {
+  this->InitData(500, 1);
+  auto encoder = MakeTypedEncoder<TypeParam>(Encoding::DELTA_LENGTH_BYTE_ARRAY,
+                                             /*use_dictionary=*/false, this->descr_.get());
+  auto decoder =
+      MakeTypedDecoder<TypeParam>(Encoding::DELTA_LENGTH_BYTE_ARRAY, this->descr_.get());
+  encoder->Put(this->draws_, this->num_values_);
+  this->encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(this->num_values_, this->encode_buffer_->data(),
+                   static_cast<int>(this->encode_buffer_->size()));
+  decoder->SkipValues(50);
+  int decoded = decoder->Decode(this->decode_buf_, 100);
+  ASSERT_EQ(100, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 50, 100));
+
+  decoder->SkipValues(150);
+  int remaining = this->num_values_ - 300;
+  decoded = decoder->Decode(this->decode_buf_, remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 300, remaining));
+}
+
+// --- DeltaByteArray encoding SkipValues ---
+
+template <typename Type>
+class TestDeltaByteArraySkipValues : public TestEncodingBase<Type> {
+ public:
+  using c_type = typename Type::c_type;
+
+  void CheckRoundtrip() override {}
+
+  void InitData(int nvalues, int repeats) override {
+    num_values_ = nvalues * repeats;
+    input_bytes_.resize(num_values_ * sizeof(c_type));
+    output_bytes_.resize(num_values_ * sizeof(c_type));
+    draws_ = reinterpret_cast<c_type*>(input_bytes_.data());
+    decode_buf_ = reinterpret_cast<c_type*>(output_bytes_.data());
+    GeneratePrefixedData<c_type>(nvalues, draws_, &data_buffer_, 0.5);
+
+    for (int j = 1; j < repeats; ++j) {
+      for (int i = 0; i < nvalues; ++i) {
+        draws_[nvalues * j + i] = draws_[i];
+      }
+    }
+
+    TestEncodingBase<Type>::InitUnencodedByteArrayDataBytes();
+  }
+
+  void CheckSkip(int skip_count) {
+    auto encoder = MakeTypedEncoder<Type>(Encoding::DELTA_BYTE_ARRAY,
+                                          /*use_dictionary=*/false, descr_.get());
+    auto decoder = MakeTypedDecoder<Type>(Encoding::DELTA_BYTE_ARRAY, descr_.get());
+
+    encoder->Put(draws_, num_values_);
+    encode_buffer_ = encoder->FlushValues();
+
+    decoder->SetData(num_values_, encode_buffer_->data(),
+                     static_cast<int>(encode_buffer_->size()));
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    int values_decoded = decoder->Decode(decode_buf_, remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(decode_buf_, draws_ + skip_count, remaining));
+  }
+
+ protected:
+  USING_BASE_MEMBERS();
+  std::vector<uint8_t> input_bytes_;
+  std::vector<uint8_t> output_bytes_;
+};
+
+using TestDeltaByteArraySkipTypes = ::testing::Types<ByteArrayType, FLBAType>;
+TYPED_TEST_SUITE(TestDeltaByteArraySkipValues, TestDeltaByteArraySkipTypes);
+
+TYPED_TEST(TestDeltaByteArraySkipValues, SkipNone) {
+  this->InitData(250, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(0));
+}
+
+TYPED_TEST(TestDeltaByteArraySkipValues, SkipSome) {
+  this->InitData(250, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(73));
+}
+
+TYPED_TEST(TestDeltaByteArraySkipValues, SkipAll) {
+  this->InitData(250, 1);
+  ASSERT_NO_FATAL_FAILURE(this->CheckSkip(250));
+}
+
+TYPED_TEST(TestDeltaByteArraySkipValues, InterleavedSkipAndDecode) {
+  this->InitData(250, 1);
+  auto encoder = MakeTypedEncoder<TypeParam>(Encoding::DELTA_BYTE_ARRAY,
+                                             /*use_dictionary=*/false, this->descr_.get());
+  auto decoder =
+      MakeTypedDecoder<TypeParam>(Encoding::DELTA_BYTE_ARRAY, this->descr_.get());
+  encoder->Put(this->draws_, this->num_values_);
+  this->encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(this->num_values_, this->encode_buffer_->data(),
+                   static_cast<int>(this->encode_buffer_->size()));
+  decoder->SkipValues(25);
+  int decoded = decoder->Decode(this->decode_buf_, 50);
+  ASSERT_EQ(50, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 25, 50));
+
+  decoder->SkipValues(75);
+  int remaining = this->num_values_ - 150;
+  decoded = decoder->Decode(this->decode_buf_, remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<typename TypeParam::c_type>(
+      this->decode_buf_, this->draws_ + 150, remaining));
+}
+
+// --- RLE Boolean encoding SkipValues ---
+
+class TestRleBooleanSkipValues : public TestEncodingBase<BooleanType> {
+ public:
+  using c_type = bool;
+
+  void CheckRoundtrip() override {}
+
+  void CheckSkip(int skip_count) {
+    auto encoder = MakeTypedEncoder<BooleanType>(Encoding::RLE,
+                                                 /*use_dictionary=*/false, descr_.get());
+    auto decoder = MakeTypedDecoder<BooleanType>(Encoding::RLE, descr_.get());
+
+    encoder->Put(draws_, num_values_);
+    encode_buffer_ = encoder->FlushValues();
+
+    decoder->SetData(num_values_, encode_buffer_->data(),
+                     static_cast<int>(encode_buffer_->size()));
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    int values_decoded = decoder->Decode(decode_buf_, remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(decode_buf_, draws_ + skip_count, remaining));
+  }
+};
+
+TEST_F(TestRleBooleanSkipValues, SkipNone) {
+  InitData(2000, 1);
+  ASSERT_NO_FATAL_FAILURE(CheckSkip(0));
+}
+
+TEST_F(TestRleBooleanSkipValues, SkipSome) {
+  InitData(2000, 1);
+  ASSERT_NO_FATAL_FAILURE(CheckSkip(137));
+}
+
+TEST_F(TestRleBooleanSkipValues, SkipAll) {
+  InitData(2000, 1);
+  ASSERT_NO_FATAL_FAILURE(CheckSkip(2000));
+}
+
+TEST_F(TestRleBooleanSkipValues, InterleavedSkipAndDecode) {
+  InitData(2000, 1);
+  auto encoder = MakeTypedEncoder<BooleanType>(Encoding::RLE,
+                                               /*use_dictionary=*/false, descr_.get());
+  auto decoder = MakeTypedDecoder<BooleanType>(Encoding::RLE, descr_.get());
+  encoder->Put(draws_, num_values_);
+  encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(num_values_, encode_buffer_->data(),
+                   static_cast<int>(encode_buffer_->size()));
+  decoder->SkipValues(100);
+  int decoded = decoder->Decode(decode_buf_, 200);
+  ASSERT_EQ(200, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<c_type>(decode_buf_, draws_ + 100, 200));
+
+  decoder->SkipValues(300);
+  int remaining = num_values_ - 600;
+  decoded = decoder->Decode(decode_buf_, remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(
+      VerifyResults<c_type>(decode_buf_, draws_ + 600, remaining));
+}
+
+// --- PLAIN Boolean encoding SkipValues ---
+
+class TestPlainBooleanSkipValues : public TestEncodingBase<BooleanType> {
+ public:
+  using c_type = bool;
+
+  void CheckRoundtrip() override {}
+
+  void CheckSkip(int skip_count) {
+    auto encoder = MakeTypedEncoder<BooleanType>(Encoding::PLAIN,
+                                                 /*use_dictionary=*/false, descr_.get());
+    auto decoder = MakeTypedDecoder<BooleanType>(Encoding::PLAIN, descr_.get());
+
+    encoder->Put(draws_, num_values_);
+    encode_buffer_ = encoder->FlushValues();
+
+    decoder->SetData(num_values_, encode_buffer_->data(),
+                     static_cast<int>(encode_buffer_->size()));
+    decoder->SkipValues(skip_count);
+    int remaining = num_values_ - skip_count;
+    int values_decoded = decoder->Decode(decode_buf_, remaining);
+    ASSERT_EQ(remaining, values_decoded);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyResults<c_type>(decode_buf_, draws_ + skip_count, remaining));
+  }
+};
+
+TEST_F(TestPlainBooleanSkipValues, SkipNone) {
+  InitData(2000, 1);
+  ASSERT_NO_FATAL_FAILURE(CheckSkip(0));
+}
+
+TEST_F(TestPlainBooleanSkipValues, SkipSome) {
+  InitData(2000, 1);
+  ASSERT_NO_FATAL_FAILURE(CheckSkip(137));
+}
+
+TEST_F(TestPlainBooleanSkipValues, SkipAll) {
+  InitData(2000, 1);
+  ASSERT_NO_FATAL_FAILURE(CheckSkip(2000));
+}
+
+TEST_F(TestPlainBooleanSkipValues, InterleavedSkipAndDecode) {
+  InitData(2000, 1);
+  auto encoder = MakeTypedEncoder<BooleanType>(Encoding::PLAIN,
+                                               /*use_dictionary=*/false, descr_.get());
+  auto decoder = MakeTypedDecoder<BooleanType>(Encoding::PLAIN, descr_.get());
+  encoder->Put(draws_, num_values_);
+  encode_buffer_ = encoder->FlushValues();
+
+  decoder->SetData(num_values_, encode_buffer_->data(),
+                   static_cast<int>(encode_buffer_->size()));
+  decoder->SkipValues(100);
+  int decoded = decoder->Decode(decode_buf_, 200);
+  ASSERT_EQ(200, decoded);
+  ASSERT_NO_FATAL_FAILURE(VerifyResults<c_type>(decode_buf_, draws_ + 100, 200));
+
+  decoder->SkipValues(300);
+  int remaining = num_values_ - 600;
+  decoded = decoder->Decode(decode_buf_, remaining);
+  ASSERT_EQ(remaining, decoded);
+  ASSERT_NO_FATAL_FAILURE(
+      VerifyResults<c_type>(decode_buf_, draws_ + 600, remaining));
+}
+
 }  // namespace parquet::test

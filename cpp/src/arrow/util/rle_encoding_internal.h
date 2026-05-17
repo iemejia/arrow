@@ -456,6 +456,11 @@ class RleBitPackedDecoder {
   /// left or if an error occurred.
   [[nodiscard]] rle_size_t GetBatch(value_type* out, rle_size_t batch_size);
 
+  /// Skip over the next batch_size values without decoding them.
+  /// Returns the number of values actually skipped (may be less than requested
+  /// if there are not enough values left or if an error occurred).
+  [[nodiscard]] rle_size_t Skip(rle_size_t batch_size);
+
   /// Like GetBatch but add spacing for null entries.
   ///
   /// Null entries will be set to an arbistrary value to avoid leaking private data.
@@ -499,6 +504,11 @@ class RleBitPackedDecoder {
     return std::visit(
         [&](auto& dec) { return dec.GetBatch(out, batch_size, value_bit_width_); },
         decoder_);
+  }
+
+  /// Advance the current run by batch_size values without decoding them.
+  [[nodiscard]] rle_size_t RunAdvance(rle_size_t batch_size) {
+    return std::visit([&](auto& dec) { return dec.Advance(batch_size); }, decoder_);
   }
 
   /// Call the parser with a single callable for all event types.
@@ -811,6 +821,48 @@ auto RleBitPackedDecoder<T>::GetBatch(value_type* out,
   });
 
   return values_read;
+}
+
+template <typename T>
+auto RleBitPackedDecoder<T>::Skip(rle_size_t batch_size) -> rle_size_t {
+  using ControlFlow = RleBitPackedParser::ControlFlow;
+
+  if (ARROW_PREDICT_FALSE(batch_size == 0)) {
+    return 0;
+  }
+
+  rle_size_t values_skipped = 0;
+
+  // Remaining from a previous call that would have left some unread data from a run.
+  if (ARROW_PREDICT_FALSE(run_remaining() > 0)) {
+    const auto skipped = RunAdvance(batch_size);
+    values_skipped += skipped;
+
+    if (ARROW_PREDICT_FALSE(values_skipped == batch_size)) {
+      return values_skipped;
+    }
+    ARROW_DCHECK(run_remaining() == 0);
+  }
+
+  ParseWithCallable([&](auto run) {
+    using RunDecoder = typename decltype(run)::template DecoderType<value_type>;
+
+    ARROW_DCHECK_LT(values_skipped, batch_size);
+    RunDecoder decoder(run, value_bit_width_);
+    const auto skipped = decoder.Advance(batch_size - values_skipped);
+    ARROW_DCHECK_LE(skipped, batch_size - values_skipped);
+    values_skipped += skipped;
+
+    // Stop reading and store remaining decoder
+    if (ARROW_PREDICT_FALSE(values_skipped == batch_size || skipped == 0)) {
+      decoder_ = std::move(decoder);
+      return ControlFlow::Break;
+    }
+
+    return ControlFlow::Continue;
+  });
+
+  return values_skipped;
 }
 
 namespace internal {
