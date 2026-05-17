@@ -1165,6 +1165,73 @@ static void BM_DictEncodingInt64_literals(benchmark::State& state) {
 
 BENCHMARK(BM_DictEncodingInt64_literals)->Range(MIN_RANGE, MAX_RANGE);
 
+// Dict DecodeArrow benchmarks for numeric types (Arrow builder path)
+// These test the batched idx_decoder_.GetBatch() optimization vs the old
+// single-element idx_decoder_.Get() path.
+template <typename Type>
+static void DecodeDictArrow(const std::vector<typename Type::c_type>& values,
+                            benchmark::State& state) {
+  using T = typename Type::c_type;
+  int num_values = static_cast<int>(values.size());
+
+  MemoryPool* allocator = default_memory_pool();
+  std::shared_ptr<ColumnDescriptor> descr = Int64Schema(Repetition::REQUIRED);
+
+  auto base_encoder =
+      MakeEncoder(Type::type_num, Encoding::PLAIN, true, descr.get(), allocator);
+  auto encoder =
+      dynamic_cast<typename EncodingTraits<Type>::Encoder*>(base_encoder.get());
+  auto dict_traits = dynamic_cast<DictEncoder<Type>*>(base_encoder.get());
+  encoder->Put(values.data(), num_values);
+
+  std::shared_ptr<ResizableBuffer> dict_buffer =
+      AllocateBuffer(allocator, dict_traits->dict_encoded_size());
+
+  std::shared_ptr<ResizableBuffer> indices =
+      AllocateBuffer(allocator, encoder->EstimatedDataEncodedSize());
+
+  dict_traits->WriteDict(dict_buffer->mutable_data());
+  int actual_bytes = dict_traits->WriteIndices(indices->mutable_data(),
+                                               static_cast<int>(indices->size()));
+
+  PARQUET_THROW_NOT_OK(indices->Resize(actual_bytes));
+
+  // Create a validity bitmap (all valid)
+  int byte_count = static_cast<int>(::arrow::bit_util::BytesForBits(num_values));
+  std::vector<uint8_t> valid_bits(byte_count, 0xFF);
+
+  for (auto _ : state) {
+    auto dict_decoder = MakeTypedDecoder<Type>(Encoding::PLAIN, descr.get());
+    dict_decoder->SetData(dict_traits->num_entries(), dict_buffer->data(),
+                          static_cast<int>(dict_buffer->size()));
+
+    auto decoder = MakeDictDecoder<Type>(descr.get());
+    decoder->SetDict(dict_decoder.get());
+    decoder->SetData(num_values, indices->data(), static_cast<int>(indices->size()));
+
+    typename EncodingTraits<Type>::Accumulator builder(allocator);
+    decoder->DecodeArrow(num_values, 0, valid_bits.data(), 0, &builder);
+  }
+
+  state.SetBytesProcessed(state.iterations() * num_values * sizeof(T));
+  state.SetItemsProcessed(state.iterations() * num_values);
+}
+
+static void BM_DictDecodingArrowInt64_repeats(benchmark::State& state) {
+  std::vector<int64_t> values(state.range(0), 64);
+  DecodeDictArrow<Int64Type>(values, state);
+}
+
+BENCHMARK(BM_DictDecodingArrowInt64_repeats)->Range(MIN_RANGE, MAX_RANGE);
+
+static void BM_DictDecodingArrowInt64_literals(benchmark::State& state) {
+  std::vector<int64_t> values(state.range(0));
+  std::iota(values.begin(), values.end(), 0);
+  DecodeDictArrow<Int64Type>(values, state);
+}
+
+BENCHMARK(BM_DictDecodingArrowInt64_literals)->Range(MIN_RANGE, MAX_RANGE);
+
 static void BM_DictDecodingByteArray(benchmark::State& state) {
   ::arrow::random::RandomArrayGenerator rag(0);
   // Using arrow generator to generate random data.
