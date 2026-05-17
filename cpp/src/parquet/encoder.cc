@@ -1661,7 +1661,7 @@ class RleBooleanEncoder final : public EncoderImpl, virtual public BooleanEncode
  public:
   explicit RleBooleanEncoder(const ColumnDescriptor* descr, ::arrow::MemoryPool* pool)
       : EncoderImpl(descr, Encoding::RLE, pool),
-        buffered_append_values_(::arrow::stl::allocator<T>(pool)) {}
+        buffered_append_values_(::arrow::stl::allocator<uint8_t>(pool)) {}
 
   int64_t EstimatedDataEncodedSize() override {
     return kRleLengthInBytes + MaxRleBufferSize();
@@ -1676,19 +1676,29 @@ class RleBooleanEncoder final : public EncoderImpl, virtual public BooleanEncode
                              values.type()->ToString());
     }
     const auto& boolean_array = checked_cast<const ::arrow::BooleanArray&>(values);
+    buffered_append_values_.reserve(buffered_append_values_.size() +
+                                    boolean_array.length() - boolean_array.null_count());
     if (values.null_count() == 0) {
-      for (int i = 0; i < boolean_array.length(); ++i) {
-        // null_count == 0, so just call Value directly is ok.
-        buffered_append_values_.push_back(boolean_array.Value(i));
+      const uint8_t* data_bitmap = boolean_array.data()->GetValues<uint8_t>(1, 0);
+      const int64_t data_offset = boolean_array.offset();
+      for (int64_t i = 0; i < boolean_array.length(); ++i) {
+        buffered_append_values_.push_back(
+            ::arrow::bit_util::GetBit(data_bitmap, data_offset + i) ? 1 : 0);
       }
     } else {
-      PARQUET_THROW_NOT_OK(::arrow::VisitArraySpanInline<::arrow::BooleanType>(
-          *boolean_array.data(),
-          [&](bool value) {
-            buffered_append_values_.push_back(value);
-            return Status::OK();
-          },
-          []() { return Status::OK(); }));
+      ::arrow::internal::VisitSetBitRunsVoid(
+          boolean_array.null_bitmap_data(), boolean_array.offset(),
+          boolean_array.length(), [&](int64_t position, int64_t length) {
+            const uint8_t* data_bitmap =
+                boolean_array.data()->GetValues<uint8_t>(1, 0);
+            const int64_t data_offset = boolean_array.offset();
+            for (int64_t i = 0; i < length; ++i) {
+              buffered_append_values_.push_back(
+                  ::arrow::bit_util::GetBit(data_bitmap, data_offset + position + i)
+                      ? 1
+                      : 0);
+            }
+          });
     }
   }
 
@@ -1721,22 +1731,25 @@ class RleBooleanEncoder final : public EncoderImpl, virtual public BooleanEncode
   /// 4 bytes in little-endian, which indicates the length.
   constexpr static int32_t kRleLengthInBytes = 4;
 
-  // std::vector<bool> in C++ is tricky, because it's a bitmap.
-  // Here RleBooleanEncoder will only append values into it, and
-  // dump values into Buffer, so using it here is ok.
-  ArrowPoolVector<bool> buffered_append_values_;
+  // Use uint8_t instead of bool to avoid std::vector<bool> proxy overhead.
+  // Each element stores 0 or 1 as a plain byte for fast append and iteration.
+  ArrowPoolVector<uint8_t> buffered_append_values_;
 };
 
 void RleBooleanEncoder::Put(const bool* src, int num_values) { PutImpl(src, num_values); }
 
 void RleBooleanEncoder::Put(const std::vector<bool>& src, int num_values) {
-  PutImpl(src, num_values);
+  buffered_append_values_.reserve(buffered_append_values_.size() + num_values);
+  for (int i = 0; i < num_values; ++i) {
+    buffered_append_values_.push_back(src[i] ? 1 : 0);
+  }
 }
 
 template <typename SequenceType>
 void RleBooleanEncoder::PutImpl(const SequenceType& src, int num_values) {
+  buffered_append_values_.reserve(buffered_append_values_.size() + num_values);
   for (int i = 0; i < num_values; ++i) {
-    buffered_append_values_.push_back(src[i]);
+    buffered_append_values_.push_back(src[i] ? 1 : 0);
   }
 }
 
@@ -1754,8 +1767,8 @@ std::shared_ptr<Buffer> RleBooleanEncoder::FlushValues() {
                                              static_cast<int>(rle_buffer_size_max),
                                              /*bit_width*/ kBitWidth);
 
-  for (bool value : buffered_append_values_) {
-    encoder.Put(value ? 1 : 0);
+  for (uint8_t value : buffered_append_values_) {
+    encoder.Put(value);
   }
   encoder.Flush();
   ::arrow::util::SafeStore(buffer->mutable_data(),
