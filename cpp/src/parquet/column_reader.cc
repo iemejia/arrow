@@ -191,6 +191,33 @@ int LevelDecoder::Decode(int batch_size, int16_t* levels) {
   return num_decoded;
 }
 
+int LevelDecoder::DecodeAndCount(int batch_size, int16_t* levels, int16_t count_target,
+                                 int64_t* count) {
+  int num_decoded = 0;
+
+  int num_values = std::min(num_values_remaining_, batch_size);
+  if (encoding_ == Encoding::RLE) {
+    num_decoded = rle_decoder_->GetBatch(levels, num_values);
+  } else {
+    num_decoded = bit_packed_decoder_->GetBatch(bit_width_, levels, num_values);
+  }
+  if (num_decoded > 0) {
+    // Single fused pass: validate bounds AND count values == count_target,
+    // replacing separate FindMinMax + std::count passes.
+    internal::MinMaxCount mmc =
+        internal::FindMinMaxAndCount(levels, num_decoded, count_target);
+    if (ARROW_PREDICT_FALSE(mmc.min < 0 || mmc.max > max_level_)) {
+      std::stringstream ss;
+      ss << "Malformed levels. min: " << mmc.min << " max: " << mmc.max
+         << " out of range.  Max Level: " << max_level_;
+      throw ParquetException(ss.str());
+    }
+    *count += mmc.count;
+  }
+  num_values_remaining_ -= num_decoded;
+  return num_decoded;
+}
+
 ReaderProperties default_reader_properties() {
   static ReaderProperties default_reader_properties;
   return default_reader_properties;
@@ -666,6 +693,17 @@ class ColumnReaderImplBase {
     return definition_level_decoder_.Decode(static_cast<int>(batch_size), levels);
   }
 
+  // Read definition levels and count non-null values (== max_def_level_) in a
+  // single fused pass, eliminating a separate std::count over the buffer.
+  int64_t ReadDefinitionLevelsAndCount(int64_t batch_size, int16_t* levels,
+                                       int64_t* non_null_count) {
+    if (max_def_level_ == 0) {
+      return 0;
+    }
+    return definition_level_decoder_.DecodeAndCount(
+        static_cast<int>(batch_size), levels, max_def_level_, non_null_count);
+  }
+
   bool HasNextInternal() {
     // Either there is no data page available yet, or the data page has been
     // exhausted
@@ -1006,14 +1044,11 @@ class TypedColumnReaderImpl : public TypedColumnReader<DType>,
 
     // If the field is required and non-repeated, there are no definition levels
     if (this->max_def_level_ > 0 && def_levels != nullptr) {
-      *num_def_levels = this->ReadDefinitionLevels(batch_size, def_levels);
+      *num_def_levels =
+          this->ReadDefinitionLevelsAndCount(batch_size, def_levels, non_null_values_to_read);
       if (ARROW_PREDICT_FALSE(*num_def_levels != batch_size)) {
         throw ParquetException(kErrorRepDefLevelNotMatchesNumValues);
       }
-      // TODO(wesm): this tallying of values-to-decode can be performed with better
-      // cache-efficiency if fused with the level decoding.
-      *non_null_values_to_read +=
-          std::count(def_levels, def_levels + *num_def_levels, this->max_def_level_);
     } else {
       // Required field, read all values
       if (num_def_levels != nullptr) {

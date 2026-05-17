@@ -53,6 +53,18 @@ inline MinMax FindMinMaxImpl(const int16_t* levels, int64_t num_levels) {
   return out;
 }
 
+inline MinMaxCount FindMinMaxAndCountImpl(const int16_t* levels, int64_t num_levels,
+                                          int16_t target) {
+  MinMaxCount out{std::numeric_limits<int16_t>::max(),
+                  std::numeric_limits<int16_t>::min(), 0};
+  for (int x = 0; x < num_levels; x++) {
+    out.min = std::min(levels[x], out.min);
+    out.max = std::max(levels[x], out.max);
+    out.count += (levels[x] == target);
+  }
+  return out;
+}
+
 inline uint64_t GreaterThanBitmapImpl(const int16_t* levels, int64_t num_levels,
                                       int16_t rhs) {
   return LevelsToBitmap(levels, num_levels, [rhs](int16_t value) { return value > rhs; });

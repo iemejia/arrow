@@ -92,6 +92,12 @@ class PARQUET_EXPORT LevelDecoder {
   // Decodes a batch of levels into an array and returns the number of levels decoded
   int Decode(int batch_size, int16_t* levels);
 
+  // Decodes a batch of levels, validates bounds, and counts values equal to
+  // count_target in a single fused pass (eliminating separate FindMinMax +
+  // std::count passes).  Returns the number of levels decoded.
+  int DecodeAndCount(int batch_size, int16_t* levels, int16_t count_target,
+                     int64_t* count);
+
  private:
   int bit_width_;
   int num_values_remaining_;
