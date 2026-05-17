@@ -232,11 +232,12 @@ void DirectPutImpl(const ::arrow::Array& values, ::arrow::BufferBuilder* sink) {
     PARQUET_THROW_NOT_OK(
         sink->Reserve((values.length() - values.null_count()) * value_size));
 
-    for (int64_t i = 0; i < values.length(); i++) {
-      if (values.IsValid(i)) {
-        sink->UnsafeAppend(&raw_values[i], value_size);
-      }
-    }
+    ::arrow::internal::VisitSetBitRunsVoid(
+        values.null_bitmap_data(), values.offset(), values.length(),
+        [&](int64_t position, int64_t length) {
+          sink->UnsafeAppend(&raw_values[position],
+                             static_cast<int64_t>(length * value_size));
+        });
   }
 }
 
@@ -376,11 +377,13 @@ class PlainEncoder<BooleanType> : public EncoderImpl, virtual public BooleanEnco
                          data.length());
     } else {
       PARQUET_THROW_NOT_OK(sink_.Reserve(data.length() - data.null_count()));
-      for (int64_t i = 0; i < data.length(); i++) {
-        if (data.IsValid(i)) {
-          sink_.UnsafeAppend(data.Value(i));
-        }
-      }
+      const uint8_t* data_buffer = data.data()->GetValues<uint8_t>(1, 0);
+      const int64_t data_offset = data.offset();
+      ::arrow::internal::VisitSetBitRunsVoid(
+          data.null_bitmap_data(), data.offset(), data.length(),
+          [&](int64_t position, int64_t length) {
+            sink_.UnsafeAppend(data_buffer, data_offset + position, length);
+          });
     }
   }
 
@@ -986,12 +989,13 @@ class ByteStreamSplitEncoder<FLBAType> : public ByteStreamSplitEncoderBase<FLBAT
       const int64_t num_values = data.length() - data.null_count();
       const int64_t total_bytes = num_values * byte_width_;
       PARQUET_THROW_NOT_OK(sink_.Reserve(total_bytes));
-      // TODO use VisitSetBitRunsVoid
-      for (int64_t i = 0; i < data.length(); i++) {
-        if (data.IsValid(i)) {
-          sink_.UnsafeAppend(data.Value(i), byte_width_);
-        }
-      }
+      ::arrow::internal::VisitSetBitRunsVoid(
+          data.null_bitmap_data(), data.offset(), data.length(),
+          [&](int64_t position, int64_t length) {
+            for (int64_t i = 0; i < length; i++) {
+              sink_.UnsafeAppend(data.Value(position + i), byte_width_);
+            }
+          });
       this->num_values_in_buffer_ += num_values;
     }
   }
