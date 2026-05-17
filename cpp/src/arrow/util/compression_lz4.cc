@@ -259,6 +259,12 @@ class Lz4FrameCodec : public Codec {
                                : compression_level),
         prefs_(PreferencesWithCompressionLevel(compression_level_)) {}
 
+  ~Lz4FrameCodec() override {
+    if (dctx_ != nullptr) {
+      ARROW_UNUSED(LZ4F_freeDecompressionContext(dctx_));
+    }
+  }
+
   int64_t MaxCompressedLen(int64_t input_len,
                            const uint8_t* ARROW_ARG_UNUSED(input)) override {
     return static_cast<int64_t>(
@@ -278,23 +284,39 @@ class Lz4FrameCodec : public Codec {
 
   Result<int64_t> Decompress(int64_t input_len, const uint8_t* input,
                              int64_t output_buffer_len, uint8_t* output_buffer) override {
-    ARROW_ASSIGN_OR_RAISE(auto decomp, MakeDecompressor());
+    RETURN_NOT_OK(EnsureDCtx());
+    // Reset the context for a new decompression session, preserving the
+    // allocated memory from previous calls.
+#if defined(LZ4_VERSION_NUMBER) && LZ4_VERSION_NUMBER >= 10800
+    LZ4F_resetDecompressionContext(dctx_);
+#else
+    // Fallback for older LZ4: recreate the context
+    ARROW_UNUSED(LZ4F_freeDecompressionContext(dctx_));
+    dctx_ = nullptr;
+    RETURN_NOT_OK(EnsureDCtx());
+#endif
 
     int64_t total_bytes_written = 0;
-    while (!decomp->IsFinished() && input_len != 0) {
-      ARROW_ASSIGN_OR_RAISE(
-          auto res,
-          decomp->Decompress(input_len, input, output_buffer_len, output_buffer));
-      input += res.bytes_read;
-      input_len -= res.bytes_read;
-      output_buffer += res.bytes_written;
-      output_buffer_len -= res.bytes_written;
-      total_bytes_written += res.bytes_written;
-      if (res.need_more_output) {
+    bool finished = false;
+    while (!finished && input_len != 0) {
+      auto src_size = static_cast<size_t>(input_len);
+      auto dst_capacity = static_cast<size_t>(output_buffer_len);
+      size_t ret = LZ4F_decompress(dctx_, output_buffer, &dst_capacity, input, &src_size,
+                                   nullptr /* options */);
+      if (LZ4F_isError(ret)) {
+        return LZ4Error(ret, "Lz4 decompress failed: ");
+      }
+      finished = (ret == 0);
+      input += src_size;
+      input_len -= static_cast<int64_t>(src_size);
+      output_buffer += dst_capacity;
+      output_buffer_len -= static_cast<int64_t>(dst_capacity);
+      total_bytes_written += static_cast<int64_t>(dst_capacity);
+      if (src_size == 0 && dst_capacity == 0) {
         return Status::IOError("Lz4 decompression buffer too small");
       }
     }
-    if (!decomp->IsFinished()) {
+    if (!finished) {
       return Status::IOError("Lz4 compressed input contains less than one frame");
     }
     if (input_len != 0) {
@@ -326,9 +348,27 @@ class Lz4FrameCodec : public Codec {
 
   int compression_level() const override { return compression_level_; }
 
- protected:
+ private:
+  // Lazily initialize the cached decompression context on first use.
+  // Subsequent calls to Decompress() reuse this context via
+  // LZ4F_resetDecompressionContext(), avoiding the overhead of
+  // LZ4F_createDecompressionContext() + LZ4F_freeDecompressionContext() per call.
+  Status EnsureDCtx() {
+    if (dctx_ == nullptr) {
+      LZ4F_errorCode_t ret = LZ4F_createDecompressionContext(&dctx_, LZ4F_VERSION);
+      if (LZ4F_isError(ret)) {
+        return LZ4Error(ret, "LZ4 decompression context create failed: ");
+      }
+    }
+    return Status::OK();
+  }
+
   const int compression_level_;
   const LZ4F_preferences_t prefs_;
+
+  // Cached decompression context — lazily initialized, reset via
+  // LZ4F_resetDecompressionContext() between one-shot Decompress() calls.
+  LZ4F_decompressionContext_t dctx_ = nullptr;
 };
 
 // ----------------------------------------------------------------------
