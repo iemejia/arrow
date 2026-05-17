@@ -1501,23 +1501,13 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
   // Read 'num_values' values and throw them away.
   // Throws an error if it could not read 'num_values'.
   void ReadAndThrowAwayValues(int64_t num_values) {
+    // Use the decoder's native SkipValues to advance without materializing data.
+    // This avoids allocating scratch buffers and the cost of full decoding.
     int64_t values_left = num_values;
-    int64_t values_read = 0;
-
-    // Allocate enough scratch space to accommodate 16-bit levels or any
-    // value type
-    this->InitScratchForSkip();
-    ARROW_DCHECK_NE(this->scratch_for_skip_, nullptr);
-    do {
-      int64_t batch_size = std::min<int64_t>(kSkipScratchBatchSize, values_left);
-      values_read = this->ReadValues(
-          batch_size, this->scratch_for_skip_->template mutable_data_as<T>());
-      values_left -= values_read;
-    } while (values_read > 0 && values_left > 0);
-    if (values_left > 0) {
-      std::stringstream ss;
-      ss << "Could not read and throw away " << num_values << " values";
-      throw ParquetException(ss.str());
+    while (values_left > 0) {
+      int batch_size = static_cast<int>(std::min<int64_t>(values_left, INT32_MAX));
+      this->current_decoder_->SkipValues(batch_size);
+      values_left -= batch_size;
     }
   }
 

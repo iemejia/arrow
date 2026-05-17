@@ -1652,4 +1652,314 @@ BENCHMARK_DEFINE_F(BM_DecodeArrowBooleanPlain, DecodeArrowWithNull)
 BENCHMARK_REGISTER_F(BM_DecodeArrowBooleanPlain, DecodeArrowWithNull)
     ->Apply(BooleanWithNullCustomArguments);
 
+// ----------------------------------------------------------------------
+// SkipValues benchmarks for each encoding.
+//
+// Each benchmark mirrors its decoding counterpart but replaces
+// decoder->Decode(...) with decoder->SkipValues(...), measuring the
+// cost of advancing the decoder state without materializing values.
+
+// --- PLAIN SkipValues ---
+
+static void BM_PlainSkipBoolean(benchmark::State& state) {
+  std::vector<bool> values(state.range(0), true);
+  auto encoder = MakeEncoder(Type::BOOLEAN, Encoding::PLAIN);
+  auto typed_encoder = dynamic_cast<BooleanEncoder*>(encoder.get());
+  typed_encoder->Put(values, static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  for (auto _ : state) {
+    auto decoder = MakeTypedDecoder<BooleanType>(Encoding::PLAIN);
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(bool));
+  state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+
+BENCHMARK(BM_PlainSkipBoolean)->Range(MIN_RANGE, MAX_RANGE);
+
+static void BM_PlainSkipInt64(benchmark::State& state) {
+  std::vector<int64_t> values(state.range(0), 64);
+  auto encoder = MakeTypedEncoder<Int64Type>(Encoding::PLAIN);
+  encoder->Put(values.data(), static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  for (auto _ : state) {
+    auto decoder = MakeTypedDecoder<Int64Type>(Encoding::PLAIN);
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(int64_t));
+}
+
+BENCHMARK(BM_PlainSkipInt64)->Range(MIN_RANGE, MAX_RANGE);
+
+static void BM_PlainSkipDouble(benchmark::State& state) {
+  std::vector<double> values(state.range(0), 64.0);
+  auto encoder = MakeTypedEncoder<DoubleType>(Encoding::PLAIN);
+  encoder->Put(values.data(), static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  for (auto _ : state) {
+    auto decoder = MakeTypedDecoder<DoubleType>(Encoding::PLAIN);
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(double));
+}
+
+BENCHMARK(BM_PlainSkipDouble)->Range(MIN_RANGE, MAX_RANGE);
+
+static void BM_PlainSkipFloat(benchmark::State& state) {
+  std::vector<float> values(state.range(0), 64.0f);
+  auto encoder = MakeTypedEncoder<FloatType>(Encoding::PLAIN);
+  encoder->Put(values.data(), static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  for (auto _ : state) {
+    auto decoder = MakeTypedDecoder<FloatType>(Encoding::PLAIN);
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(float));
+}
+
+BENCHMARK(BM_PlainSkipFloat)->Range(MIN_RANGE, MAX_RANGE);
+
+static void SkippingByteArrayBenchmark(benchmark::State& state,
+                                       Encoding::type encoding) {
+  ::arrow::random::RandomArrayGenerator rag(0);
+  int32_t max_length = static_cast<int32_t>(state.range(0));
+  int32_t array_size = static_cast<int32_t>(state.range(1));
+  auto array =
+      rag.String(/* size */ array_size, /* min_length */ 0, /* max_length */ max_length,
+                 /* null_probability */ 0);
+  const auto array_actual =
+      ::arrow::internal::checked_pointer_cast<::arrow::StringArray>(array);
+  auto encoder = MakeTypedEncoder<ByteArrayType>(encoding);
+  encoder->Put(*array);
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  for (auto _ : state) {
+    auto decoder = MakeTypedDecoder<ByteArrayType>(encoding);
+    decoder->SetData(static_cast<int>(array->length()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(array->length()));
+  }
+  state.SetItemsProcessed(state.iterations() * array->length());
+  state.SetBytesProcessed(state.iterations() * (array_actual->value_data()->size() +
+                                                 array_actual->value_offsets()->size()));
+}
+
+static void BM_PlainSkipByteArray(benchmark::State& state) {
+  SkippingByteArrayBenchmark(state, Encoding::PLAIN);
+}
+
+BENCHMARK(BM_PlainSkipByteArray)->Apply(ByteArrayCustomArguments);
+
+// --- DELTA_BINARY_PACKED SkipValues ---
+
+template <typename DType, typename NumberGenerator>
+static void BM_DeltaBitPackingSkip(benchmark::State& state, NumberGenerator gen) {
+  using T = typename DType::c_type;
+  std::vector<T> values = gen(state.range(0));
+  auto encoder = MakeTypedEncoder<DType>(Encoding::DELTA_BINARY_PACKED);
+  encoder->Put(values.data(), static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  auto decoder = MakeTypedDecoder<DType>(Encoding::DELTA_BINARY_PACKED);
+  for (auto _ : state) {
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(T));
+  state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+
+static void BM_DeltaBitPackingSkip_Int32_Fixed(benchmark::State& state) {
+  BM_DeltaBitPackingSkip<Int32Type>(state, MakeDeltaBitPackingInputFixed<Int32Type>);
+}
+static void BM_DeltaBitPackingSkip_Int64_Fixed(benchmark::State& state) {
+  BM_DeltaBitPackingSkip<Int64Type>(state, MakeDeltaBitPackingInputFixed<Int64Type>);
+}
+static void BM_DeltaBitPackingSkip_Int32_Narrow(benchmark::State& state) {
+  BM_DeltaBitPackingSkip<Int32Type>(state, MakeDeltaBitPackingInputNarrow<Int32Type>);
+}
+static void BM_DeltaBitPackingSkip_Int64_Narrow(benchmark::State& state) {
+  BM_DeltaBitPackingSkip<Int64Type>(state, MakeDeltaBitPackingInputNarrow<Int64Type>);
+}
+static void BM_DeltaBitPackingSkip_Int32_Wide(benchmark::State& state) {
+  BM_DeltaBitPackingSkip<Int32Type>(state, MakeDeltaBitPackingInputWide<Int32Type>);
+}
+static void BM_DeltaBitPackingSkip_Int64_Wide(benchmark::State& state) {
+  BM_DeltaBitPackingSkip<Int64Type>(state, MakeDeltaBitPackingInputWide<Int64Type>);
+}
+
+BENCHMARK(BM_DeltaBitPackingSkip_Int32_Fixed)->Range(MIN_RANGE, MAX_RANGE);
+BENCHMARK(BM_DeltaBitPackingSkip_Int64_Fixed)->Range(MIN_RANGE, MAX_RANGE);
+BENCHMARK(BM_DeltaBitPackingSkip_Int32_Narrow)->Range(MIN_RANGE, MAX_RANGE);
+BENCHMARK(BM_DeltaBitPackingSkip_Int64_Narrow)->Range(MIN_RANGE, MAX_RANGE);
+BENCHMARK(BM_DeltaBitPackingSkip_Int32_Wide)->Range(MIN_RANGE, MAX_RANGE);
+BENCHMARK(BM_DeltaBitPackingSkip_Int64_Wide)->Range(MIN_RANGE, MAX_RANGE);
+
+// --- DELTA_LENGTH_BYTE_ARRAY SkipValues ---
+
+static void BM_DeltaLengthSkipByteArray(benchmark::State& state) {
+  SkippingByteArrayBenchmark(state, Encoding::DELTA_LENGTH_BYTE_ARRAY);
+}
+
+BENCHMARK(BM_DeltaLengthSkipByteArray)->Apply(ByteArrayCustomArguments);
+
+// --- DELTA_BYTE_ARRAY SkipValues ---
+
+static void BM_DeltaSkipByteArray(benchmark::State& state) {
+  DeltaByteArrayState delta_state(state);
+  std::vector<ByteArray> values = delta_state.MakeRandomByteArray(/*seed=*/42);
+
+  auto encoder = MakeTypedEncoder<ByteArrayType>(Encoding::DELTA_BYTE_ARRAY);
+  encoder->Put(values.data(), static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  const int64_t plain_encoded_size =
+      delta_state.total_data_size + 4 * delta_state.array_length;
+  const int64_t encoded_size = buf->size();
+
+  auto decoder = MakeTypedDecoder<ByteArrayType>(Encoding::DELTA_BYTE_ARRAY);
+  for (auto _ : state) {
+    decoder->SetData(delta_state.array_length, buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(delta_state.array_length);
+  }
+  state.SetItemsProcessed(state.iterations() * delta_state.array_length);
+  state.SetBytesProcessed(state.iterations() * delta_state.total_data_size);
+  state.counters["compression_ratio"] =
+      static_cast<double>(plain_encoded_size) / encoded_size;
+}
+
+BENCHMARK(BM_DeltaSkipByteArray)->Apply(ByteArrayDeltaCustomArguments);
+
+// --- RLE Boolean SkipValues ---
+
+static void BM_RleSkipBoolean(benchmark::State& state) {
+  std::vector<bool> values(state.range(0), true);
+  auto encoder = MakeEncoder(Type::BOOLEAN, Encoding::RLE);
+  auto typed_encoder = dynamic_cast<BooleanEncoder*>(encoder.get());
+  typed_encoder->Put(values, static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  auto decoder = MakeTypedDecoder<BooleanType>(Encoding::RLE);
+  for (auto _ : state) {
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(bool));
+}
+
+BENCHMARK(BM_RleSkipBoolean)->Range(MIN_RANGE, MAX_RANGE);
+
+// --- Dictionary SkipValues ---
+
+template <typename Type>
+static void SkipDict(const std::vector<typename Type::c_type>& values,
+                     benchmark::State& state) {
+  using T = typename Type::c_type;
+  int num_values = static_cast<int>(values.size());
+
+  MemoryPool* allocator = default_memory_pool();
+  std::shared_ptr<ColumnDescriptor> descr = Int64Schema(Repetition::REQUIRED);
+
+  auto base_encoder =
+      MakeEncoder(Type::type_num, Encoding::PLAIN, true, descr.get(), allocator);
+  auto encoder =
+      dynamic_cast<typename EncodingTraits<Type>::Encoder*>(base_encoder.get());
+  auto dict_traits = dynamic_cast<DictEncoder<Type>*>(base_encoder.get());
+  encoder->Put(values.data(), num_values);
+
+  std::shared_ptr<ResizableBuffer> dict_buffer =
+      AllocateBuffer(allocator, dict_traits->dict_encoded_size());
+
+  std::shared_ptr<ResizableBuffer> indices =
+      AllocateBuffer(allocator, encoder->EstimatedDataEncodedSize());
+
+  dict_traits->WriteDict(dict_buffer->mutable_data());
+  int actual_bytes = dict_traits->WriteIndices(indices->mutable_data(),
+                                               static_cast<int>(indices->size()));
+
+  PARQUET_THROW_NOT_OK(indices->Resize(actual_bytes));
+
+  for (auto _ : state) {
+    auto dict_decoder = MakeTypedDecoder<Type>(Encoding::PLAIN, descr.get());
+    dict_decoder->SetData(dict_traits->num_entries(), dict_buffer->data(),
+                          static_cast<int>(dict_buffer->size()));
+
+    auto decoder = MakeDictDecoder<Type>(descr.get());
+    decoder->SetDict(dict_decoder.get());
+    decoder->SetData(num_values, indices->data(), static_cast<int>(indices->size()));
+    decoder->SkipValues(num_values);
+  }
+
+  state.SetBytesProcessed(state.iterations() * num_values * sizeof(T));
+  state.SetItemsProcessed(state.iterations() * num_values);
+}
+
+static void BM_DictSkipInt64_repeats(benchmark::State& state) {
+  std::vector<int64_t> values(state.range(0), 64);
+  SkipDict<Int64Type>(values, state);
+}
+
+BENCHMARK(BM_DictSkipInt64_repeats)->Range(MIN_RANGE, MAX_RANGE);
+
+static void BM_DictSkipInt64_literals(benchmark::State& state) {
+  std::vector<int64_t> values(state.range(0));
+  std::iota(values.begin(), values.end(), 0);
+  SkipDict<Int64Type>(values, state);
+}
+
+BENCHMARK(BM_DictSkipInt64_literals)->Range(MIN_RANGE, MAX_RANGE);
+
+// --- ByteStreamSplit SkipValues ---
+
+static void BM_ByteStreamSplitSkipFloat(benchmark::State& state) {
+  std::vector<float> values(state.range(0), 64.0f);
+  auto encoder = MakeTypedEncoder<FloatType>(Encoding::BYTE_STREAM_SPLIT);
+  encoder->Put(values.data(), static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  for (auto _ : state) {
+    auto decoder = MakeTypedDecoder<FloatType>(Encoding::BYTE_STREAM_SPLIT);
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(float));
+  state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+
+BENCHMARK(BM_ByteStreamSplitSkipFloat)->Range(MIN_RANGE, MAX_RANGE);
+
+static void BM_ByteStreamSplitSkipDouble(benchmark::State& state) {
+  std::vector<double> values(state.range(0), 64.0);
+  auto encoder = MakeTypedEncoder<DoubleType>(Encoding::BYTE_STREAM_SPLIT);
+  encoder->Put(values.data(), static_cast<int>(values.size()));
+  std::shared_ptr<Buffer> buf = encoder->FlushValues();
+
+  for (auto _ : state) {
+    auto decoder = MakeTypedDecoder<DoubleType>(Encoding::BYTE_STREAM_SPLIT);
+    decoder->SetData(static_cast<int>(values.size()), buf->data(),
+                     static_cast<int>(buf->size()));
+    decoder->SkipValues(static_cast<int>(values.size()));
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0) * sizeof(double));
+  state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+
+BENCHMARK(BM_ByteStreamSplitSkipDouble)->Range(MIN_RANGE, MAX_RANGE);
+
 }  // namespace parquet
