@@ -339,6 +339,21 @@ class TypedDecoderImpl : public DecoderImpl, virtual public TypedDecoder<DType> 
     }
   }
 
+  // Default fallback: decode values into scratch buffer and discard.
+  // Subclasses should override with optimized implementations.
+  void SkipValues(int num_values) override {
+    constexpr int kSkipBatchSize = 256;
+    T scratch[kSkipBatchSize];
+    while (num_values > 0) {
+      int batch = std::min(num_values, kSkipBatchSize);
+      int decoded = this->Decode(scratch, batch);
+      if (ARROW_PREDICT_FALSE(decoded == 0)) {
+        throw ParquetException("Could not skip values in decoder");
+      }
+      num_values -= decoded;
+    }
+  }
+
   int type_length_;
 };
 
@@ -362,6 +377,36 @@ class PlainDecoder : public TypedDecoderImpl<DType> {
   int DecodeArrow(int num_values, int null_count, const uint8_t* valid_bits,
                   int64_t valid_bits_offset,
                   typename EncodingTraits<DType>::DictAccumulator* builder) override;
+
+  void SkipValues(int num_values) override {
+    num_values = std::min(num_values, this->num_values_);
+    if constexpr (std::is_same_v<DType, ByteArrayType>) {
+      // Variable-length: must parse length headers to find boundaries
+      int bytes_skipped = 0;
+      for (int i = 0; i < num_values; ++i) {
+        if (ARROW_PREDICT_FALSE(this->len_ - bytes_skipped < 4)) {
+          ParquetException::EofException();
+        }
+        auto value_len = SafeLoadAs<int32_t>(this->data_ + bytes_skipped);
+        if (ARROW_PREDICT_FALSE(value_len < 0 ||
+                                value_len > this->len_ - bytes_skipped - 4)) {
+          throw ParquetException("Invalid BYTE_ARRAY length in SkipValues");
+        }
+        bytes_skipped += 4 + value_len;
+      }
+      this->data_ += bytes_skipped;
+      this->len_ -= bytes_skipped;
+    } else {
+      // Fixed-width: simple pointer arithmetic
+      int64_t bytes_to_skip = static_cast<int64_t>(this->type_length_) * num_values;
+      if (ARROW_PREDICT_FALSE(bytes_to_skip > this->len_)) {
+        ParquetException::EofException();
+      }
+      this->data_ += bytes_to_skip;
+      this->len_ -= static_cast<int>(bytes_to_skip);
+    }
+    this->num_values_ -= num_values;
+  }
 };
 
 template <>
@@ -547,6 +592,8 @@ class PlainBooleanDecoder : public TypedDecoderImpl<BooleanType>, public Boolean
                   int64_t valid_bits_offset,
                   typename EncodingTraits<BooleanType>::DictAccumulator* out) override;
 
+  void SkipValues(int num_values) override;
+
  private:
   std::unique_ptr<::arrow::bit_util::BitReader> bit_reader_;
   int total_num_values_{0};
@@ -646,6 +693,14 @@ int PlainBooleanDecoder::Decode(bool* buffer, int max_values) {
   }
   num_values_ -= max_values;
   return max_values;
+}
+
+void PlainBooleanDecoder::SkipValues(int num_values) {
+  num_values = std::min(num_values, num_values_);
+  if (ARROW_PREDICT_FALSE(!bit_reader_->Advance(num_values))) {
+    ParquetException::EofException();
+  }
+  num_values_ -= num_values;
 }
 
 // PLAIN decoder implementation for FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY
@@ -905,6 +960,15 @@ class DictDecoderImpl : public TypedDecoderImpl<Type>, public DictDecoder<Type> 
     }
     this->num_values_ -= num_values;
     return num_values;
+  }
+
+  void SkipValues(int num_values) override {
+    num_values = std::min(num_values, this->num_values_);
+    // Skip indices in the RLE decoder without performing dictionary lookups
+    if (static_cast<int>(idx_decoder_.Skip(num_values)) != num_values) {
+      ParquetException::EofException();
+    }
+    this->num_values_ -= num_values;
   }
 
   int DecodeSpaced(T* buffer, int num_values, int null_count, const uint8_t* valid_bits,
@@ -1476,6 +1540,8 @@ class DeltaBitPackDecoder : public TypedDecoderImpl<DType> {
     return GetInternal(buffer, max_values);
   }
 
+  void SkipValues(int num_values) override { SkipInternal(num_values); }
+
   int DecodeArrow(int num_values, int null_count, const uint8_t* valid_bits,
                   int64_t valid_bits_offset,
                   typename EncodingTraits<DType>::Accumulator* out) override {
@@ -1683,6 +1749,79 @@ class DeltaBitPackDecoder : public TypedDecoderImpl<DType> {
     return max_values;
   }
 
+  void SkipInternal(int num_values) {
+    num_values = static_cast<int>(std::min<int64_t>(num_values, total_values_remaining_));
+    if (num_values == 0) {
+      return;
+    }
+
+    int i = 0;
+
+    if (ARROW_PREDICT_FALSE(!first_block_initialized_)) {
+      // First value is last_value_ (from header), just skip it
+      ++i;
+      if (ARROW_PREDICT_FALSE(i == num_values)) {
+        if (total_value_count_ != 1) {
+          InitBlock();
+        }
+        total_values_remaining_ -= num_values;
+        this->num_values_ -= num_values;
+        return;
+      }
+      InitBlock();
+    }
+
+    DCHECK(first_block_initialized_);
+    while (i < num_values) {
+      // Ensure we have an initialized mini-block
+      if (ARROW_PREDICT_FALSE(values_remaining_current_mini_block_ == 0)) {
+        ++mini_block_idx_;
+        if (mini_block_idx_ < mini_blocks_per_block_) {
+          InitMiniBlock(delta_bit_widths_->data()[mini_block_idx_]);
+        } else {
+          InitBlock();
+        }
+      }
+
+      int values_to_skip = std::min(values_remaining_current_mini_block_,
+                                    static_cast<uint32_t>(num_values - i));
+      if (delta_bit_width_ == 0) {
+        // All deltas are zero-width: compute prefix sum directly
+        last_value_ += static_cast<UT>(values_to_skip) * static_cast<UT>(min_delta_);
+      } else {
+        // Must decode deltas to maintain running prefix sum (last_value_),
+        // but we avoid writing to an output buffer.
+        constexpr int kScratchSize = 256;
+        T scratch[kScratchSize];
+        int remaining = values_to_skip;
+        while (remaining > 0) {
+          int batch = std::min(remaining, kScratchSize);
+          if (decoder_->GetBatch(delta_bit_width_, scratch, batch) != batch) {
+            ParquetException::EofException();
+          }
+          for (int j = 0; j < batch; ++j) {
+            last_value_ = static_cast<UT>(min_delta_) + static_cast<UT>(scratch[j]) +
+                          static_cast<UT>(last_value_);
+          }
+          remaining -= batch;
+        }
+      }
+      values_remaining_current_mini_block_ -= values_to_skip;
+      i += values_to_skip;
+    }
+    total_values_remaining_ -= num_values;
+    this->num_values_ -= num_values;
+
+    if (ARROW_PREDICT_FALSE(total_values_remaining_ == 0)) {
+      uint32_t padding_bits = values_remaining_current_mini_block_ * delta_bit_width_;
+      // skip the padding bits
+      if (!decoder_->Advance(padding_bits)) {
+        ParquetException::EofException();
+      }
+      values_remaining_current_mini_block_ = 0;
+    }
+  }
+
   MemoryPool* pool_;
   std::shared_ptr<::arrow::bit_util::BitReader> decoder_;
   uint32_t values_per_block_;
@@ -1764,6 +1903,31 @@ class DeltaLengthByteArrayDecoder : public TypedDecoderImpl<ByteArrayType> {
     this->num_values_ -= max_values;
     num_valid_values_ -= max_values;
     return max_values;
+  }
+
+  void SkipValues(int num_values) override {
+    num_values = std::min(num_values, num_valid_values_);
+    if (num_values == 0) {
+      return;
+    }
+
+    int32_t data_size = 0;
+    const int32_t* length_ptr = buffered_length_->data_as<int32_t>() + length_idx_;
+    for (int i = 0; i < num_values; ++i) {
+      int32_t len = length_ptr[i];
+      if (ARROW_PREDICT_FALSE(len < 0)) {
+        throw ParquetException("negative string delta length");
+      }
+      if (AddWithOverflow(data_size, len, &data_size)) {
+        throw ParquetException("excess expansion in DELTA_(LENGTH_)BYTE_ARRAY");
+      }
+    }
+    length_idx_ += num_values;
+    if (ARROW_PREDICT_FALSE(!decoder_->Advance(8 * static_cast<int64_t>(data_size)))) {
+      ParquetException::EofException();
+    }
+    this->num_values_ -= num_values;
+    num_valid_values_ -= num_values;
   }
 
   int DecodeArrow(int num_values, int null_count, const uint8_t* valid_bits,
@@ -1895,6 +2059,14 @@ class RleBooleanDecoder : public TypedDecoderImpl<BooleanType>, public BooleanDe
 
   int Decode(uint8_t* buffer, int max_values) override {
     ParquetException::NYI("Decode(uint8_t*, int) for RleBooleanDecoder");
+  }
+
+  void SkipValues(int num_values) override {
+    num_values = std::min(num_values, num_values_);
+    if (static_cast<int>(decoder_->Skip(num_values)) != num_values) {
+      ParquetException::EofException();
+    }
+    num_values_ -= num_values;
   }
 
   int DecodeArrow(int num_values, int null_count, const uint8_t* valid_bits,
@@ -2031,6 +2203,12 @@ class DeltaByteArrayDecoderImpl : public TypedDecoderImpl<DType> {
                   typename EncodingTraits<DType>::DictAccumulator* builder) override {
     ParquetException::NYI("DecodeArrow of DictAccumulator for DeltaByteArrayDecoder");
   }
+
+  // DeltaByteArray has prefix-dependency: each value depends on its predecessor's
+  // content, so we cannot skip faster than decoding. We rely on the default
+  // TypedDecoderImpl::SkipValues fallback which calls Decode() -> GetInternal(),
+  // the already-optimized path that pre-computes total size, does one allocation,
+  // and uses memcpy with string_view tracking.
 
  protected:
   template <bool is_first_run>
@@ -2272,6 +2450,15 @@ class ByteStreamSplitDecoderBase : public TypedDecoderImpl<DType> {
                   int64_t valid_bits_offset,
                   typename EncodingTraits<DType>::DictAccumulator* builder) override {
     ParquetException::NYI("DecodeArrow to DictAccumulator for BYTE_STREAM_SPLIT");
+  }
+
+  void SkipValues(int num_values) override {
+    num_values = std::min(num_values, this->num_values_);
+    // BYTE_STREAM_SPLIT layout: byte j of value i is at data_[j * stride + i].
+    // Skipping is just pointer arithmetic.
+    this->data_ += num_values;
+    this->num_values_ -= num_values;
+    this->len_ -= this->type_length_ * num_values;
   }
 
   int DecodeArrow(int num_values, int null_count, const uint8_t* valid_bits,

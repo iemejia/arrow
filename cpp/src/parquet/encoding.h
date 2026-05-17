@@ -261,6 +261,16 @@ class Decoder {
   // the number of values left in this page.
   virtual int values_left() const = 0;
   virtual Encoding::type encoding() const = 0;
+
+  /// \brief Skip the specified number of values without materializing them.
+  ///
+  /// This is an optimization for skip/seek operations. Instead of decoding values
+  /// into a scratch buffer only to discard them, this method advances the decoder's
+  /// internal state to skip past the given number of values.
+  ///
+  /// \param[in] num_values number of values to skip. Must be <= values_left().
+  /// \throws ParquetException if there are not enough values to skip or on error.
+  virtual void SkipValues(int num_values) = 0;
 };
 
 template <typename DType>
