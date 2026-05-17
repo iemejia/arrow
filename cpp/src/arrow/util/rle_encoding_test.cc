@@ -1291,4 +1291,180 @@ TEST(RleBitPacked, GetBatchSpacedRoundtripUint64) {
   DoTestGetBatchSpacedRoundtrip<uint64_t>();
 }
 
+// --- RleBitPackedDecoder::Skip tests ---
+
+TEST(RleBitPacked, SkipNone) {
+  const int len = 64 * 1024;
+  uint8_t buffer[len];
+  std::vector<int> values = {1, 2, 3, 4, 5, 6, 7, 8};
+  int bit_width = 4;
+
+  RleBitPackedEncoder encoder(buffer, len, bit_width);
+  for (auto v : values) {
+    ASSERT_TRUE(encoder.Put(v));
+  }
+  int encoded_len = encoder.Flush();
+
+  RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+  ASSERT_EQ(0, decoder.Skip(0));
+  std::vector<int> result(values.size());
+  ASSERT_EQ(values.size(),
+            decoder.GetBatch(result.data(), static_cast<int>(values.size())));
+  EXPECT_EQ(values, result);
+}
+
+TEST(RleBitPacked, SkipSome) {
+  const int len = 64 * 1024;
+  uint8_t buffer[len];
+  std::vector<int> values = {1, 2, 3, 4, 5, 6, 7, 8};
+  int bit_width = 4;
+
+  RleBitPackedEncoder encoder(buffer, len, bit_width);
+  for (auto v : values) {
+    ASSERT_TRUE(encoder.Put(v));
+  }
+  int encoded_len = encoder.Flush();
+
+  RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+  ASSERT_EQ(3, decoder.Skip(3));
+  std::vector<int> result(5);
+  ASSERT_EQ(5u, decoder.GetBatch(result.data(), 5));
+  std::vector<int> expected(values.begin() + 3, values.end());
+  EXPECT_EQ(expected, result);
+}
+
+TEST(RleBitPacked, SkipAll) {
+  const int len = 64 * 1024;
+  uint8_t buffer[len];
+  std::vector<int> values = {1, 2, 3, 4, 5, 6, 7, 8};
+  int bit_width = 4;
+
+  RleBitPackedEncoder encoder(buffer, len, bit_width);
+  for (auto v : values) {
+    ASSERT_TRUE(encoder.Put(v));
+  }
+  int encoded_len = encoder.Flush();
+
+  RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+  ASSERT_EQ(static_cast<int>(values.size()), decoder.Skip(static_cast<int>(values.size())));
+  int val = -1;
+  EXPECT_FALSE(decoder.Get(&val));
+}
+
+TEST(RleBitPacked, SkipRleRuns) {
+  // Test skipping across RLE runs (repeated values)
+  const int len = 64 * 1024;
+  uint8_t buffer[len];
+  std::vector<int> values;
+  int bit_width = 4;
+
+  // 100 copies of 3, then 100 copies of 7
+  for (int i = 0; i < 100; ++i) values.push_back(3);
+  for (int i = 0; i < 100; ++i) values.push_back(7);
+
+  RleBitPackedEncoder encoder(buffer, len, bit_width);
+  for (auto v : values) {
+    ASSERT_TRUE(encoder.Put(v));
+  }
+  int encoded_len = encoder.Flush();
+
+  // Skip 50 (within first RLE run)
+  {
+    RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+    ASSERT_EQ(50, decoder.Skip(50));
+    std::vector<int> result(150);
+    ASSERT_EQ(150u, decoder.GetBatch(result.data(), 150));
+    std::vector<int> expected(values.begin() + 50, values.end());
+    EXPECT_EQ(expected, result);
+  }
+
+  // Skip 100 (exact boundary between runs)
+  {
+    RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+    ASSERT_EQ(100, decoder.Skip(100));
+    std::vector<int> result(100);
+    ASSERT_EQ(100u, decoder.GetBatch(result.data(), 100));
+    std::vector<int> expected(values.begin() + 100, values.end());
+    EXPECT_EQ(expected, result);
+  }
+
+  // Skip 150 (into second run)
+  {
+    RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+    ASSERT_EQ(150, decoder.Skip(150));
+    std::vector<int> result(50);
+    ASSERT_EQ(50u, decoder.GetBatch(result.data(), 50));
+    std::vector<int> expected(values.begin() + 150, values.end());
+    EXPECT_EQ(expected, result);
+  }
+}
+
+TEST(RleBitPacked, SkipBitPackedRuns) {
+  // Test skipping across bit-packed runs (varying values)
+  const int len = 64 * 1024;
+  uint8_t buffer[len];
+  std::vector<int> values;
+  int bit_width = 8;
+
+  // Generate 256 distinct values (will be bit-packed, not RLE)
+  for (int i = 0; i < 256; ++i) values.push_back(i % 256);
+
+  RleBitPackedEncoder encoder(buffer, len, bit_width);
+  for (auto v : values) {
+    ASSERT_TRUE(encoder.Put(v));
+  }
+  int encoded_len = encoder.Flush();
+
+  // Skip various amounts
+  for (int skip : {1, 7, 8, 31, 32, 33, 64, 127, 128, 200}) {
+    RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+    ASSERT_EQ(skip, decoder.Skip(skip));
+    int remaining = static_cast<int>(values.size()) - skip;
+    std::vector<int> result(remaining);
+    ASSERT_EQ(static_cast<size_t>(remaining),
+              decoder.GetBatch(result.data(), remaining));
+    std::vector<int> expected(values.begin() + skip, values.end());
+    EXPECT_EQ(expected, result) << "Failed for skip=" << skip;
+  }
+}
+
+TEST(RleBitPacked, InterleavedSkipAndGet) {
+  const int len = 64 * 1024;
+  uint8_t buffer[len];
+  std::vector<int> values;
+  int bit_width = 4;
+
+  // Mix of RLE and bit-packed: 50 copies of 5, then 50 distinct, then 50 copies of 9
+  for (int i = 0; i < 50; ++i) values.push_back(5);
+  for (int i = 0; i < 50; ++i) values.push_back(i % 16);
+  for (int i = 0; i < 50; ++i) values.push_back(9);
+
+  RleBitPackedEncoder encoder(buffer, len, bit_width);
+  for (auto v : values) {
+    ASSERT_TRUE(encoder.Put(v));
+  }
+  int encoded_len = encoder.Flush();
+
+  RleBitPackedDecoder<int> decoder(buffer, encoded_len, bit_width);
+  // Skip 25, read 25
+  ASSERT_EQ(25, decoder.Skip(25));
+  std::vector<int> result(25);
+  ASSERT_EQ(25u, decoder.GetBatch(result.data(), 25));
+  std::vector<int> expected1(values.begin() + 25, values.begin() + 50);
+  EXPECT_EQ(expected1, result);
+
+  // Skip 30, read 20
+  ASSERT_EQ(30, decoder.Skip(30));
+  std::vector<int> result2(20);
+  ASSERT_EQ(20u, decoder.GetBatch(result2.data(), 20));
+  std::vector<int> expected2(values.begin() + 80, values.begin() + 100);
+  EXPECT_EQ(expected2, result2);
+
+  // Read remaining
+  std::vector<int> result3(50);
+  ASSERT_EQ(50u, decoder.GetBatch(result3.data(), 50));
+  std::vector<int> expected3(values.begin() + 100, values.end());
+  EXPECT_EQ(expected3, result3);
+}
+
 }  // namespace arrow::util
