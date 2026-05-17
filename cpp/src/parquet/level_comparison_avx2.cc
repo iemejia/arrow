@@ -32,5 +32,10 @@ MinMax FindMinMaxAvx2(const int16_t* levels, int64_t num_levels) {
   return avx2::FindMinMaxImpl(levels, num_levels);
 }
 
+MinMaxCount FindMinMaxAndCountAvx2(const int16_t* levels, int64_t num_levels,
+                                   int16_t target) {
+  return avx2::FindMinMaxAndCountImpl(levels, num_levels, target);
+}
+
 }  // namespace internal
 }  // namespace parquet
