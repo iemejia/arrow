@@ -22,7 +22,6 @@
 #include <vector>
 
 #include "arrow/filesystem/filesystem.h"
-#include "arrow/io/caching.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/uri.h"
 
@@ -202,7 +201,6 @@ struct ARROW_EXPORT AzureOptions {
   Status ConfigureEnvironmentCredential();
 
   bool Equals(const AzureOptions& other) const;
-
 
   std::string AccountBlobUrl(const std::string& account_name) const;
   std::string AccountDfsUrl(const std::string& account_name) const;

@@ -73,6 +73,7 @@
 
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/writer.h"
+#include "parquet/file_reader.h"
 #include "parquet/properties.h"
 
 namespace arrow {
@@ -113,8 +114,11 @@ static Status MakeRawObject(AzureFileSystem* fs, const std::string& path,
 }
 
 /// Create a Parquet file with mixed column types
+/// chunk_size controls row group size (rows per row group)
 static Status MakeParquetObject(AzureFileSystem* fs, const std::string& path,
-                                int num_columns, int num_rows) {
+                                int num_columns, int num_rows,
+                                int chunk_size = 0) {
+  if (chunk_size == 0) chunk_size = num_rows;  // single row group by default
   FieldVector fields;
   fields.push_back(field("id", int64(), /*nullable=*/false));
   fields.push_back(field("timestamp", int64(), /*nullable=*/true,
@@ -133,7 +137,7 @@ static Status MakeParquetObject(AzureFileSystem* fs, const std::string& path,
 
   ARROW_ASSIGN_OR_RAISE(auto sink, fs->OpenOutputStream(path));
   RETURN_NOT_OK(parquet::arrow::WriteTable(*table, default_memory_pool(), sink,
-                                           /*chunk_size=*/num_rows));
+                                           /*chunk_size=*/chunk_size));
   return Status::OK();
 }
 
@@ -155,6 +159,12 @@ static Status EnsureTestData(AzureFileSystem* fs, const std::string& container) 
   auto pq_c20 = container + "/pq_c20_r100k";
   auto pq_c100 = container + "/pq_c100_r50k";
 
+  // Fabric-realistic files:
+  // - 200 columns, 500K rows, 2 row groups (~250MB total, ~16MB column chunks)
+  auto pq_fabric_wide = container + "/pq_fabric_c200_r500k";
+  // - 200 columns, 1M rows, 4 row groups (~500MB total, ~16MB column chunks)
+  auto pq_fabric_large = container + "/pq_fabric_c200_r1m";
+
   if (!ObjectExists(fs, raw_1mib)) {
     std::fprintf(stderr, "[bench] Creating %s ...\n", raw_1mib.c_str());
     RETURN_NOT_OK(MakeRawObject(fs, raw_1mib, 1 * 1024 * 1024));
@@ -174,6 +184,20 @@ static Status EnsureTestData(AzureFileSystem* fs, const std::string& container) 
   if (!ObjectExists(fs, pq_c100)) {
     std::fprintf(stderr, "[bench] Creating %s ...\n", pq_c100.c_str());
     RETURN_NOT_OK(MakeParquetObject(fs, pq_c100, 100, 50000));
+  }
+  if (!ObjectExists(fs, pq_fabric_wide)) {
+    std::fprintf(stderr, "[bench] Creating %s (~250MB, 200 cols, 2 row groups)...\n",
+                 pq_fabric_wide.c_str());
+    // 200 cols × 500K rows × 8 bytes ≈ 800MB raw, compressed ~250MB
+    // chunk_size=250000 → 2 row groups of 250K rows each
+    RETURN_NOT_OK(MakeParquetObject(fs, pq_fabric_wide, 200, 500000, 250000));
+  }
+  if (!ObjectExists(fs, pq_fabric_large)) {
+    std::fprintf(stderr, "[bench] Creating %s (~500MB, 200 cols, 4 row groups)...\n",
+                 pq_fabric_large.c_str());
+    // 200 cols × 1M rows × 8 bytes ≈ 1.6GB raw, compressed ~500MB
+    // chunk_size=250000 → 4 row groups of 250K rows each
+    RETURN_NOT_OK(MakeParquetObject(fs, pq_fabric_large, 200, 1000000, 250000));
   }
   return Status::OK();
 }
@@ -681,6 +705,184 @@ BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetWrite100Col_Snappy)(benchmark::State
                parquet::Compression::SNAPPY);
 }
 BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetWrite100Col_Snappy)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// ---------------------------------------------------------------------------
+// Fabric-Realistic benchmarks (Real Azure only)
+// ---------------------------------------------------------------------------
+// These simulate real Fabric/Spark read patterns:
+//   - Wide tables (200 columns)
+//   - Large files (250-500 MB) with multiple row groups
+//   - Selective projection (15 cols out of 200 — typical analytics query)
+//   - Sparse column selection (every 10th column — worst case for coalescing)
+//   - Footer-only read (metadata discovery pattern)
+// ---------------------------------------------------------------------------
+
+// --- Fabric: Read 15 contiguous columns from 200-col, 250MB file (2 row groups) ---
+// Simulates: SELECT col0..col14 FROM wide_table
+// Column chunks are ~8-16 MB each; reads ~120-240 MB of data
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Read15of200_Contiguous)
+(benchmark::State& st) {
+  std::vector<int> cols(15);
+  std::iota(cols.begin(), cols.end(), 0);  // first 15 columns
+  ParquetRead(st, fs_.get(), container_ + "/pq_fabric_c200_r500k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Read15of200_Contiguous)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Read 15 sparse columns from 200-col, 250MB file (2 row groups) ---
+// Simulates: SELECT col0, col13, col26, ... FROM wide_table (BI dashboard pattern)
+// Columns are spread across the file; tests coalescing vs parallel fetch tradeoff
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Read15of200_Sparse)
+(benchmark::State& st) {
+  std::vector<int> cols;
+  for (int i = 0; i < 200 && static_cast<int>(cols.size()) < 15; i += 13) {
+    cols.push_back(i);
+  }
+  ParquetRead(st, fs_.get(), container_ + "/pq_fabric_c200_r500k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Read15of200_Sparse)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Read 50 columns from 200-col, 250MB file (medium-wide query) ---
+// Simulates: larger analytics query pulling ~25% of columns
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Read50of200_Contiguous)
+(benchmark::State& st) {
+  std::vector<int> cols(50);
+  std::iota(cols.begin(), cols.end(), 0);  // first 50 columns
+  ParquetRead(st, fs_.get(), container_ + "/pq_fabric_c200_r500k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Read50of200_Contiguous)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Read 15 contiguous columns from 500MB file (4 row groups) ---
+// Simulates: same query on larger Delta table partition
+// Tests P2 impact when column chunks are ~16MB each across 4 row groups
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Read15of200_Large)
+(benchmark::State& st) {
+  std::vector<int> cols(15);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_fabric_c200_r1m", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Read15of200_Large)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Read 15 sparse columns from 500MB file (4 row groups) ---
+// Worst case for P2: large column chunks with gaps between them
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Read15of200_Sparse_Large)
+(benchmark::State& st) {
+  std::vector<int> cols;
+  for (int i = 0; i < 200 && static_cast<int>(cols.size()) < 15; i += 13) {
+    cols.push_back(i);
+  }
+  ParquetRead(st, fs_.get(), container_ + "/pq_fabric_c200_r1m", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Read15of200_Sparse_Large)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Read ALL 200 columns from 250MB file (full scan) ---
+// Simulates: SELECT * for data export or full table scan
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_ReadAll200)
+(benchmark::State& st) {
+  std::vector<int> cols(200);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_fabric_c200_r500k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_ReadAll200)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Write 200-col table with Snappy (realistic Spark output) ---
+// 200 cols × 250K rows → ~250MB file with 1 row group
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Write200Col_Snappy)
+(benchmark::State& st) {
+  ParquetWrite(st, fs_.get(), container_ + "/pq_fabric_write_snappy", 200, 250000,
+               parquet::Compression::SNAPPY);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Write200Col_Snappy)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Write 200-col table with Zstd (optimized storage) ---
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Write200Col_Zstd)
+(benchmark::State& st) {
+  ParquetWrite(st, fs_.get(), container_ + "/pq_fabric_write_zstd", 200, 250000,
+               parquet::Compression::ZSTD);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Write200Col_Zstd)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Fabric: Footer-only read (metadata discovery) ---
+// Simulates: reading just the Parquet footer to discover schema/row groups
+// This is the first I/O operation in any Parquet read and directly affected by
+// retry policy (P1). Tests the 2 sequential GETs: 8 bytes + footer.
+static void ParquetFooterOnly(benchmark::State& st, AzureFileSystem* fs,
+                              const std::string& path) {
+  for (auto _ : st) {
+    ASSERT_OK_AND_ASSIGN(auto file, fs->OpenInputFile(path));
+
+    parquet::ReaderProperties parquet_properties = parquet::default_reader_properties();
+    std::unique_ptr<parquet::ParquetFileReader> reader =
+        parquet::ParquetFileReader::Open(file, parquet_properties);
+    auto metadata = reader->metadata();
+    benchmark::DoNotOptimize(metadata->num_row_groups());
+    benchmark::DoNotOptimize(metadata->num_columns());
+    benchmark::DoNotOptimize(metadata->num_rows());
+  }
+  st.counters["num_row_groups"] = 0;  // filled below
+  st.counters["num_columns"] = 0;
+}
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_FooterRead_250MB)
+(benchmark::State& st) {
+  ParquetFooterOnly(st, fs_.get(), container_ + "/pq_fabric_c200_r500k");
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_FooterRead_250MB)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(10);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_FooterRead_500MB)
+(benchmark::State& st) {
+  ParquetFooterOnly(st, fs_.get(), container_ + "/pq_fabric_c200_r1m");
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_FooterRead_500MB)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(10);
+
+// --- Fabric: Read with pre_buffer=false (no coalescing, sequential reads) ---
+// Simulates: naive reader or custom readers that issue individual column reads
+BENCHMARK_DEFINE_F(AzureBlobFixture, Fabric_Read15of200_NoPrebuffer)
+(benchmark::State& st) {
+  std::vector<int> cols(15);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_fabric_c200_r500k", cols,
+              /*pre_buffer=*/false, io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Read15of200_NoPrebuffer)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond)
     ->Iterations(3);

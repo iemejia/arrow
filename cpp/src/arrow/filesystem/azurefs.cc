@@ -430,7 +430,7 @@ Result<std::unique_ptr<Blobs::BlobServiceClient>> AzureOptions::MakeBlobServiceC
   switch (credential_kind_) {
     case CredentialKind::kAnonymous:
       return std::make_unique<Blobs::BlobServiceClient>(AccountBlobUrl(account_name),
-                                                         client_options);
+                                                        client_options);
     case CredentialKind::kDefault:
       if (!token_credential_) {
         token_credential_ = std::make_shared<Azure::Identity::DefaultAzureCredential>();
@@ -908,12 +908,6 @@ class ObjectInputFile final : public io::RandomAccessFile {
     Http::HttpRange range{position, nbytes};
     Storage::Blobs::DownloadBlobToOptions download_options;
     download_options.Range = range;
-    // Disable SDK-level multi-threaded chunking: Arrow's ReadRangeCache already
-    // coalesces ranges optimally. Using Concurrency=1 and InitialChunkSize=nbytes
-    // ensures exactly one HTTP GET per ReadAt call, avoiding the SDK's internal
-    // thread pool overhead (which is significant for small Parquet column reads).
-    download_options.TransferOptions.Concurrency = 1;
-    download_options.TransferOptions.InitialChunkSize = nbytes;
     try {
       return blob_client_
           ->DownloadTo(reinterpret_cast<uint8_t*>(out), nbytes, download_options)
