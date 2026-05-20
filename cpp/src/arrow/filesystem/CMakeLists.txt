@@ -62,6 +62,22 @@ if(ARROW_AZURE)
                  filesystem
                  EXTRA_LINK_LIBS
                  ${AZURE_SDK_LINK_LIBRARIES})
+
+  if(ARROW_BUILD_BENCHMARKS AND ARROW_PARQUET)
+    add_arrow_benchmark(azurefs_benchmark
+                        PREFIX
+                        "arrow-filesystem"
+                        SOURCES
+                        azurefs_benchmark.cc
+                        STATIC_LINK_LIBS
+                        ${AZURE_SDK_LINK_LIBRARIES}
+                        ${ARROW_BENCHMARK_LINK_LIBS})
+    if(ARROW_TEST_LINKAGE STREQUAL "static")
+      target_link_libraries(arrow-filesystem-azurefs-benchmark PRIVATE parquet_static)
+    else()
+      target_link_libraries(arrow-filesystem-azurefs-benchmark PRIVATE parquet_shared)
+    endif()
+  endif()
 endif()
 
 if(ARROW_S3)
