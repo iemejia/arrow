@@ -214,22 +214,6 @@ struct ARROW_EXPORT AzureOptions {
 
   bool Equals(const AzureOptions& other) const;
 
-  /// \brief Compute recommended CacheOptions for Azure Blob Storage reads.
-  ///
-  /// Uses the Bandwidth-Delay Product formula to compute optimal I/O coalescing
-  /// parameters for cloud storage. This dramatically reduces the number of HTTP
-  /// requests compared to the generic defaults (which use 8KB hole_size_limit).
-  ///
-  /// For Azure within a region: TTFB ~5-15ms, Bandwidth ~1000-1500 MiB/s.
-  /// This yields hole_size_limit ~12 MB and range_size_limit = 64 MB.
-  ///
-  /// \param[in] ttfb_millis Time-to-first-byte in milliseconds (default: 10)
-  /// \param[in] bandwidth_mib_per_sec Transfer bandwidth in MiB/s (default: 1250)
-  /// \return CacheOptions optimized for Azure network characteristics
-  static io::CacheOptions RecommendedCacheOptions(int64_t ttfb_millis = 10,
-                                                  int64_t bandwidth_mib_per_sec = 1250) {
-    return io::CacheOptions::MakeFromNetworkMetrics(ttfb_millis, bandwidth_mib_per_sec);
-  }
 
   std::string AccountBlobUrl(const std::string& account_name) const;
   std::string AccountDfsUrl(const std::string& account_name) const;

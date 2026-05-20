@@ -504,12 +504,6 @@ BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole1MiB)(benchmark::Stat
 }
 BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole1MiB)->UseRealTime();
 
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole12MiB)(benchmark::State& st) {
-  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 12 * 1024 * 1024,
-                64 * 1024 * 1024);
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole12MiB)->UseRealTime();
-
 BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead20Col_DefaultCache)(benchmark::State& st) {
   std::vector<int> cols(20);
   std::iota(cols.begin(), cols.end(), 0);
@@ -517,16 +511,6 @@ BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead20Col_DefaultCache)(benchmark::Sta
               io::CacheOptions::LazyDefaults());
 }
 BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead20Col_DefaultCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead20Col_AzureCache)(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);
-  ParquetRead(st, fs_.get(), container_ + "/pq_c20_r100k", cols, true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead20Col_AzureCache)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
@@ -541,17 +525,6 @@ BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Sparse_DefaultCache)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Sparse_AzureCache)
-(benchmark::State& st) {
-  std::vector<int> cols;
-  for (int i = 0; i < 100; i += 10) cols.push_back(i);
-  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Sparse_AzureCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
 BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Contiguous_DefaultCache)
 (benchmark::State& st) {
   std::vector<int> cols(20);
@@ -560,17 +533,6 @@ BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Contiguous_DefaultCache)
               io::CacheOptions::LazyDefaults());
 }
 BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Contiguous_DefaultCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Contiguous_AzureCache)
-(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);
-  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Contiguous_AzureCache)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
@@ -664,15 +626,6 @@ BENCHMARK_REGISTER_F(AzureBlobFixture, ReadCoalesced100MiB_Hole1MiB)
     ->UseRealTime()
     ->Iterations(3);
 
-BENCHMARK_DEFINE_F(AzureBlobFixture, ReadCoalesced100MiB_Hole12MiB)
-(benchmark::State& st) {
-  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 12 * 1024 * 1024,
-                64 * 1024 * 1024);
-}
-BENCHMARK_REGISTER_F(AzureBlobFixture, ReadCoalesced100MiB_Hole12MiB)
-    ->UseRealTime()
-    ->Iterations(3);
-
 BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead20Col_DefaultCache)
 (benchmark::State& st) {
   std::vector<int> cols(20);
@@ -681,18 +634,6 @@ BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead20Col_DefaultCache)
               io::CacheOptions::LazyDefaults());
 }
 BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead20Col_DefaultCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond)
-    ->Iterations(5);
-
-BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead20Col_AzureCache)
-(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);
-  ParquetRead(st, fs_.get(), container_ + "/pq_c20_r100k", cols, true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead20Col_AzureCache)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond)
     ->Iterations(5);
@@ -709,18 +650,6 @@ BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Sparse_DefaultCache)
     ->Unit(benchmark::kMillisecond)
     ->Iterations(5);
 
-BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Sparse_AzureCache)
-(benchmark::State& st) {
-  std::vector<int> cols;
-  for (int i = 0; i < 100; i += 10) cols.push_back(i);
-  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Sparse_AzureCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond)
-    ->Iterations(5);
-
 BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Contiguous_DefaultCache)
 (benchmark::State& st) {
   std::vector<int> cols(20);
@@ -729,18 +658,6 @@ BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Contiguous_DefaultCache)
               io::CacheOptions::LazyDefaults());
 }
 BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Contiguous_DefaultCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond)
-    ->Iterations(5);
-
-BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Contiguous_AzureCache)
-(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);
-  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Contiguous_AzureCache)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond)
     ->Iterations(5);
