@@ -108,17 +108,6 @@ struct ARROW_EXPORT AzureOptions {
   /// Whether OutputStream writes will be issued in the background, without blocking.
   bool background_writes = true;
 
-  /// \brief Size of each block uploaded via StageBlock for block blobs.
-  ///
-  /// Larger blocks reduce the number of HTTP round trips at the cost of higher
-  /// memory usage. Each block upload may require up to 2x this amount of memory
-  /// (one buffer filling while the previous uploads in the background).
-  /// Azure maximum block size: 4 GiB. Azure limit: 50,000 blocks per blob.
-  /// At 64 MiB default, max blob size = 50000 * 64 MiB = 3.2 TiB.
-  ///
-  /// Default: 64 MiB (vs previous 10 MiB). This reduces HTTP round trips 6x.
-  int64_t block_upload_size = 64 * 1024 * 1024;
-
  private:
   enum class CredentialKind {
     kDefault,

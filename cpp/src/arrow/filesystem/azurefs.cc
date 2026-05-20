@@ -256,7 +256,6 @@ bool AzureOptions::Equals(const AzureOptions& other) const {
       dfs_storage_scheme == other.dfs_storage_scheme &&
       default_metadata == other.default_metadata &&
       background_writes == other.background_writes &&
-      block_upload_size == other.block_upload_size &&
       credential_kind_ == other.credential_kind_ && account_key_ == other.account_key_ &&
       sas_token_ == other.sas_token_ && tenant_id_ == other.tenant_id_ &&
       client_id_ == other.client_id_ && client_secret_ == other.client_secret_;
@@ -1048,8 +1047,8 @@ void SkipStartingEmptyPages(DataLake::ListPathsPagedResponse& paged_response) {
   }
 }
 
-/// Writes will be buffered up to the configured block_upload_size before uploading.
-/// The default is set via AzureOptions::block_upload_size (64 MiB).
+/// Writes will be buffered up to this size (in bytes) before actually uploading them.
+static constexpr int64_t kBlockUploadSizeBytes = 10 * 1024 * 1024;
 /// The maximum size of a block in Azure Blob (as per docs).
 static constexpr int64_t kMaxBlockSizeBytes = 4LL * 1024 * 1024 * 1024;
 
@@ -1070,8 +1069,7 @@ class ObjectAppendStream final : public io::OutputStream {
       : block_blob_client_(std::move(block_blob_client)),
         io_context_(io_context),
         location_(location),
-        background_writes_(options.background_writes),
-        block_upload_size_(options.block_upload_size) {
+        background_writes_(options.background_writes) {
     if (metadata && metadata->size() != 0) {
       ArrowMetadataToCommitBlockListOptions(metadata, commit_block_list_options_);
     } else if (options.default_metadata && options.default_metadata->size() != 0) {
@@ -1264,13 +1262,13 @@ class ObjectAppendStream final : public io::OutputStream {
     if (current_block_size_ > 0) {
       // Try to fill current buffer
       const int64_t to_copy =
-          std::min(nbytes, block_upload_size_ - current_block_size_);
+          std::min(nbytes, kBlockUploadSizeBytes - current_block_size_);
       RETURN_NOT_OK(current_block_->Write(data_ptr, to_copy));
       current_block_size_ += to_copy;
       advance_ptr(to_copy);
 
       // If buffer isn't full, break
-      if (current_block_size_ < block_upload_size_) {
+      if (current_block_size_ < kBlockUploadSizeBytes) {
         return Status::OK();
       }
 
@@ -1279,7 +1277,7 @@ class ObjectAppendStream final : public io::OutputStream {
     }
 
     // We can upload chunks without copying them into a buffer
-    while (nbytes >= block_upload_size_) {
+    while (nbytes >= kBlockUploadSizeBytes) {
       const auto upload_size = std::min(nbytes, kMaxBlockSizeBytes);
       RETURN_NOT_OK(AppendBlock(data_ptr, upload_size));
       advance_ptr(upload_size);
@@ -1292,10 +1290,10 @@ class ObjectAppendStream final : public io::OutputStream {
       if (current_block_ == nullptr) {
         ARROW_ASSIGN_OR_RAISE(
             current_block_,
-            io::BufferOutputStream::Create(block_upload_size_, io_context_.pool()));
+            io::BufferOutputStream::Create(kBlockUploadSizeBytes, io_context_.pool()));
       } else {
         // Re-use the allocation from before.
-        RETURN_NOT_OK(current_block_->Reset(block_upload_size_, io_context_.pool()));
+        RETURN_NOT_OK(current_block_->Reset(kBlockUploadSizeBytes, io_context_.pool()));
       }
 
       RETURN_NOT_OK(current_block_->Write(data_ptr, current_block_size_));
@@ -1402,7 +1400,6 @@ class ObjectAppendStream final : public io::OutputStream {
   const io::IOContext io_context_;
   const AzureLocation location_;
   const bool background_writes_;
-  const int64_t block_upload_size_;
   int64_t content_length_ = kNoSize;
 
   std::shared_ptr<io::BufferOutputStream> current_block_;

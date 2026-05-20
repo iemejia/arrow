@@ -300,7 +300,7 @@ class AzureBlobFixture : public benchmark::Fixture {
 // Write benchmarks: measure block upload overhead
 // ---------------------------------------------------------------------------
 
-/// Write a blob using the configured block_upload_size
+/// Write a blob
 static void WriteBlob(benchmark::State& st, AzureFileSystem* fs,
                       const std::string& container, int64_t total_size,
                       int64_t write_chunk_size) {
@@ -320,8 +320,6 @@ static void WriteBlob(benchmark::State& st, AzureFileSystem* fs,
     total_bytes += total_size;
   }
   st.SetBytesProcessed(total_bytes);
-  st.counters["block_size_mib"] =
-      static_cast<double>(fs->options().block_upload_size) / (1024 * 1024);
 }
 
 /// Read entire file in a single ReadAt call
@@ -448,8 +446,6 @@ static void ParquetWrite(benchmark::State& st, AzureFileSystem* fs,
     total_bytes += num_rows * num_columns * 8;  // approximate
   }
   st.SetBytesProcessed(total_bytes);
-  st.counters["block_size_mib"] =
-      static_cast<double>(fs->options().block_upload_size) / (1024 * 1024);
 }
 
 // ---------------------------------------------------------------------------
