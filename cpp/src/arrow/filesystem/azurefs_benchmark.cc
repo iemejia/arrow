@@ -47,6 +47,8 @@
 //    Objects are reused across runs (only created if missing).
 
 #include <cstdlib>
+#include <future>
+#include <iomanip>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -199,6 +201,35 @@ static Status EnsureTestData(AzureFileSystem* fs, const std::string& container) 
     // chunk_size=250000 → 4 row groups of 250K rows each
     RETURN_NOT_OK(MakeParquetObject(fs, pq_fabric_large, 200, 1000000, 250000));
   }
+
+  // Multi-file dataset: 50 Parquet files × 20 cols × 50K rows (~8MB each)
+  // Simulates a Delta table with 50 partition files
+  auto multifile_dir = container + "/multifile_50x8mb";
+  if (!ObjectExists(fs, multifile_dir + "/part_00000")) {
+    std::fprintf(stderr,
+                 "[bench] Creating %s (50 files × ~8MB, 20 cols × 50K rows)...\n",
+                 multifile_dir.c_str());
+    for (int i = 0; i < 50; i++) {
+      std::stringstream ss;
+      ss << multifile_dir << "/part_" << std::setfill('0') << std::setw(5) << i;
+      RETURN_NOT_OK(MakeParquetObject(fs, ss.str(), 20, 50000));
+    }
+  }
+
+  // Multi-file dataset: 20 Parquet files × 50 cols × 200K rows (~64MB each)
+  // Simulates larger partition files from a wide table
+  auto multifile_large_dir = container + "/multifile_20x64mb";
+  if (!ObjectExists(fs, multifile_large_dir + "/part_00000")) {
+    std::fprintf(stderr,
+                 "[bench] Creating %s (20 files × ~64MB, 50 cols × 200K rows)...\n",
+                 multifile_large_dir.c_str());
+    for (int i = 0; i < 20; i++) {
+      std::stringstream ss;
+      ss << multifile_large_dir << "/part_" << std::setfill('0') << std::setw(5) << i;
+      RETURN_NOT_OK(MakeParquetObject(fs, ss.str(), 50, 200000));
+    }
+  }
+
   return Status::OK();
 }
 
@@ -886,6 +917,272 @@ BENCHMARK_REGISTER_F(AzureBlobFixture, Fabric_Read15of200_NoPrebuffer)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond)
     ->Iterations(3);
+
+// ---------------------------------------------------------------------------
+// Multi-file benchmarks (Real Azure only)
+// ---------------------------------------------------------------------------
+// Simulate Spark/Fabric patterns: reading/writing many files concurrently.
+// This is where throttling (503/429) occurs and retry policy matters most.
+// ---------------------------------------------------------------------------
+
+/// Read N Parquet files in parallel using std::async (simulates Spark stage)
+static void MultiFileParallelRead(benchmark::State& st, AzureFileSystem* fs,
+                                  const std::string& dir, int num_files,
+                                  const std::vector<int>& column_indices,
+                                  bool pre_buffer) {
+  // Build file paths
+  std::vector<std::string> paths;
+  paths.reserve(num_files);
+  for (int i = 0; i < num_files; i++) {
+    std::stringstream ss;
+    ss << dir << "/part_" << std::setfill('0') << std::setw(5) << i;
+    paths.push_back(ss.str());
+  }
+
+  int64_t total_bytes = 0;
+  for (auto _ : st) {
+    std::vector<std::future<int64_t>> futures;
+    futures.reserve(num_files);
+
+    for (const auto& path : paths) {
+      futures.push_back(std::async(std::launch::async, [&fs, &path, &column_indices,
+                                                        pre_buffer]() -> int64_t {
+        auto file_result = fs->OpenInputFile(path);
+        if (!file_result.ok()) return 0;
+        auto file = file_result.MoveValueUnsafe();
+        auto size_result = file->GetSize();
+        if (!size_result.ok()) return 0;
+
+        parquet::ArrowReaderProperties properties;
+        properties.set_use_threads(true);
+        properties.set_pre_buffer(pre_buffer);
+        properties.set_cache_options(io::CacheOptions::LazyDefaults());
+
+        parquet::ReaderProperties parquet_properties = parquet::default_reader_properties();
+        std::unique_ptr<parquet::arrow::FileReader> reader;
+        parquet::arrow::FileReaderBuilder builder;
+        if (!builder.Open(file, parquet_properties).ok()) return 0;
+        if (!builder.properties(properties)->Build(&reader).ok()) return 0;
+
+        std::shared_ptr<Table> table;
+        auto table_result = reader->ReadTable(column_indices);
+        if (!table_result.ok()) return 0;
+        return *size_result;
+      }));
+    }
+
+    // Wait for all reads to complete, sum bytes
+    for (auto& f : futures) {
+      total_bytes += f.get();
+    }
+  }
+  st.SetBytesProcessed(total_bytes);
+  st.counters["num_files"] = static_cast<double>(num_files);
+}
+
+/// Read N Parquet files sequentially (measures per-file overhead)
+static void MultiFileSequentialRead(benchmark::State& st, AzureFileSystem* fs,
+                                    const std::string& dir, int num_files,
+                                    const std::vector<int>& column_indices,
+                                    bool pre_buffer) {
+  std::vector<std::string> paths;
+  paths.reserve(num_files);
+  for (int i = 0; i < num_files; i++) {
+    std::stringstream ss;
+    ss << dir << "/part_" << std::setfill('0') << std::setw(5) << i;
+    paths.push_back(ss.str());
+  }
+
+  int64_t total_bytes = 0;
+  for (auto _ : st) {
+    for (const auto& path : paths) {
+      ASSERT_OK_AND_ASSIGN(auto file, fs->OpenInputFile(path));
+      ASSERT_OK_AND_ASSIGN(auto size, file->GetSize());
+
+      parquet::ArrowReaderProperties properties;
+      properties.set_use_threads(true);
+      properties.set_pre_buffer(pre_buffer);
+      properties.set_cache_options(io::CacheOptions::LazyDefaults());
+
+      parquet::ReaderProperties parquet_properties = parquet::default_reader_properties();
+      std::unique_ptr<parquet::arrow::FileReader> reader;
+      parquet::arrow::FileReaderBuilder builder;
+      ASSERT_OK(builder.Open(file, parquet_properties));
+      ASSERT_OK(builder.properties(properties)->Build(&reader));
+      ASSERT_OK_AND_ASSIGN(auto table, reader->ReadTable(column_indices));
+      total_bytes += size;
+    }
+  }
+  st.SetBytesProcessed(total_bytes);
+  st.counters["num_files"] = static_cast<double>(num_files);
+}
+
+/// Write N Parquet files sequentially (simulates Spark task outputs)
+static void MultiFileWrite(benchmark::State& st, AzureFileSystem* fs,
+                           const std::string& dir, int num_files, int num_columns,
+                           int num_rows, parquet::Compression::type compression) {
+  // Pre-generate table data (shared across all files, like Spark partitioned output)
+  FieldVector fields;
+  fields.push_back(field("id", int64(), /*nullable=*/false));
+  for (int i = 0; i < num_columns - 1; i++) {
+    std::stringstream ss;
+    ss << "col" << i;
+    fields.push_back(
+        field(ss.str(), float64(), /*nullable=*/true,
+              key_value_metadata(
+                  {{"min", "-1.e10"}, {"max", "1e10"}, {"null_probability", "0.05"}})));
+  }
+  auto batch = random::GenerateBatch(fields, num_rows, /*seed=*/42);
+  std::shared_ptr<Table> table;
+  ASSERT_OK_AND_ASSIGN(table, Table::FromRecordBatches({batch}));
+
+  int64_t total_bytes = 0;
+  for (auto _ : st) {
+    for (int i = 0; i < num_files; i++) {
+      std::stringstream ss;
+      ss << dir << "/write_" << std::setfill('0') << std::setw(5) << i;
+      auto path = ss.str();
+
+      ASSERT_OK_AND_ASSIGN(auto sink, fs->OpenOutputStream(path));
+      auto writer_props =
+          parquet::WriterProperties::Builder().compression(compression)->build();
+      ASSERT_OK(parquet::arrow::WriteTable(*table, default_memory_pool(), sink,
+                                           /*chunk_size=*/num_rows, writer_props));
+      total_bytes += num_rows * num_columns * 8;  // approximate
+    }
+  }
+  st.SetBytesProcessed(total_bytes);
+  st.counters["num_files"] = static_cast<double>(num_files);
+}
+
+/// Open N files and read only their footers (metadata discovery pattern)
+static void MultiFileFooterScan(benchmark::State& st, AzureFileSystem* fs,
+                                const std::string& dir, int num_files) {
+  std::vector<std::string> paths;
+  paths.reserve(num_files);
+  for (int i = 0; i < num_files; i++) {
+    std::stringstream ss;
+    ss << dir << "/part_" << std::setfill('0') << std::setw(5) << i;
+    paths.push_back(ss.str());
+  }
+
+  int64_t files_scanned = 0;
+  for (auto _ : st) {
+    for (const auto& path : paths) {
+      ASSERT_OK_AND_ASSIGN(auto file, fs->OpenInputFile(path));
+      parquet::ReaderProperties parquet_properties = parquet::default_reader_properties();
+      auto reader = parquet::ParquetFileReader::Open(file, parquet_properties);
+      auto metadata = reader->metadata();
+      benchmark::DoNotOptimize(metadata->num_row_groups());
+      benchmark::DoNotOptimize(metadata->num_columns());
+      benchmark::DoNotOptimize(metadata->num_rows());
+      files_scanned++;
+    }
+  }
+  st.counters["num_files"] = static_cast<double>(num_files);
+  st.counters["files_per_sec"] =
+      benchmark::Counter(static_cast<double>(files_scanned), benchmark::Counter::kIsRate);
+}
+
+// --- Multi-file: Parallel read 50 × 8MB files (all columns) ---
+// Simulates: Spark stage reading all partitions of a Delta table concurrently
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_50x8MB_ParallelRead_AllCols)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  MultiFileParallelRead(st, fs_.get(), container_ + "/multifile_50x8mb", 50, cols, true);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_50x8MB_ParallelRead_AllCols)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Multi-file: Parallel read 50 × 8MB files (5 of 20 columns) ---
+// Simulates: analytics query selecting subset of columns across all partitions
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_50x8MB_ParallelRead_5Cols)
+(benchmark::State& st) {
+  std::vector<int> cols = {0, 4, 8, 12, 16};
+  MultiFileParallelRead(st, fs_.get(), container_ + "/multifile_50x8mb", 50, cols, true);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_50x8MB_ParallelRead_5Cols)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Multi-file: Sequential read 50 × 8MB files (all columns) ---
+// Simulates: single-threaded scan or serial partition processing
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_50x8MB_SequentialRead_AllCols)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  MultiFileSequentialRead(st, fs_.get(), container_ + "/multifile_50x8mb", 50, cols,
+                          true);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_50x8MB_SequentialRead_AllCols)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Multi-file: Parallel read 20 × 64MB files (15 of 50 columns) ---
+// Simulates: Spark stage with larger partitions, selective projection
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_20x64MB_ParallelRead_15Cols)
+(benchmark::State& st) {
+  std::vector<int> cols(15);
+  std::iota(cols.begin(), cols.end(), 0);
+  MultiFileParallelRead(st, fs_.get(), container_ + "/multifile_20x64mb", 20, cols, true);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_20x64MB_ParallelRead_15Cols)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Multi-file: Parallel read 20 × 64MB files (all 50 columns) ---
+// Simulates: full scan of wide-table partition files
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_20x64MB_ParallelRead_AllCols)
+(benchmark::State& st) {
+  std::vector<int> cols(50);
+  std::iota(cols.begin(), cols.end(), 0);
+  MultiFileParallelRead(st, fs_.get(), container_ + "/multifile_20x64mb", 20, cols, true);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_20x64MB_ParallelRead_AllCols)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Multi-file: Footer scan 50 files (metadata discovery) ---
+// Simulates: Delta table schema/stats read, or partition pruning scan
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_50x8MB_FooterScan)
+(benchmark::State& st) {
+  MultiFileFooterScan(st, fs_.get(), container_ + "/multifile_50x8mb", 50);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_50x8MB_FooterScan)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// --- Multi-file: Write 50 × 8MB files (Spark task output pattern) ---
+// Simulates: 50 Spark tasks each writing one partition file
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_Write50x8MB_Snappy)
+(benchmark::State& st) {
+  MultiFileWrite(st, fs_.get(), container_ + "/multifile_write_50x8mb", 50, 20, 50000,
+                 parquet::Compression::SNAPPY);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_Write50x8MB_Snappy)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(1);
+
+// --- Multi-file: Write 20 × 64MB files (larger partition output) ---
+// Simulates: Spark job writing wide-table partitions
+BENCHMARK_DEFINE_F(AzureBlobFixture, MultiFile_Write20x64MB_Snappy)
+(benchmark::State& st) {
+  MultiFileWrite(st, fs_.get(), container_ + "/multifile_write_20x64mb", 20, 50, 200000,
+                 parquet::Compression::SNAPPY);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, MultiFile_Write20x64MB_Snappy)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(1);
 
 }  // namespace fs
 }  // namespace arrow
