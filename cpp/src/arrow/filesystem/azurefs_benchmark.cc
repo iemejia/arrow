@@ -23,11 +23,30 @@
 //   - I/O coalescing (hole_size_limit: 8 KB vs 12 MB)
 //   - Retry policy tuning
 //
-// Requires Azurite (Azure Storage emulator) to be installed:
-//   npm install -g azurite
+// === RUNNING MODES ===
 //
-// The benchmark starts/stops Azurite automatically.
+// 1) LOCAL (Azurite) — default, no env vars needed:
+//      ./arrow-filesystem-azurefs-benchmark
+//
+//    Requires Azurite: npm install -g azurite
+//    Starts/stops Azurite automatically.
+//
+// 2) REAL AZURE — set environment variables:
+//      export AZURE_STORAGE_ACCOUNT="mystorageaccount"
+//      export AZURE_STORAGE_KEY="base64key..."
+//      ./arrow-filesystem-azurefs-benchmark
+//
+//    Or use a connection string:
+//      export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;..."
+//      ./arrow-filesystem-azurefs-benchmark
+//
+//    Optional: set container name (default: "arrowbench")
+//      export AZURE_BENCH_CONTAINER="mycontainer"
+//
+//    The benchmark will create the container and test objects automatically.
+//    Objects are reused across runs (only created if missing).
 
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -62,12 +81,114 @@ namespace fs {
 using ::arrow::internal::TemporaryDir;
 
 // ---------------------------------------------------------------------------
-// Azurite fixture: starts/stops Azurite for each benchmark iteration group
+// Helper: get optional environment variable
+// ---------------------------------------------------------------------------
+static std::string GetEnvOrEmpty(const char* name) {
+  const char* val = std::getenv(name);
+  return val ? std::string(val) : std::string();
+}
+
+static bool IsRealAzureMode() {
+  return !GetEnvOrEmpty("AZURE_STORAGE_CONNECTION_STRING").empty() ||
+         !GetEnvOrEmpty("AZURE_STORAGE_ACCOUNT").empty();
+}
+
+// ---------------------------------------------------------------------------
+// Shared test data creation helpers
+// ---------------------------------------------------------------------------
+
+/// Create a raw blob with deterministic data
+static Status MakeRawObject(AzureFileSystem* fs, const std::string& path,
+                            int64_t size) {
+  ARROW_ASSIGN_OR_RAISE(auto sink, fs->OpenOutputStream(path));
+  const int64_t chunk_size = 1024 * 1024;
+  std::string chunk(chunk_size, 'X');
+  int64_t remaining = size;
+  while (remaining > 0) {
+    int64_t to_write = std::min(remaining, chunk_size);
+    RETURN_NOT_OK(sink->Write(chunk.data(), to_write));
+    remaining -= to_write;
+  }
+  return sink->Close();
+}
+
+/// Create a Parquet file with mixed column types
+static Status MakeParquetObject(AzureFileSystem* fs, const std::string& path,
+                                int num_columns, int num_rows) {
+  FieldVector fields;
+  fields.push_back(field("id", int64(), /*nullable=*/false));
+  fields.push_back(field("timestamp", int64(), /*nullable=*/true,
+                         key_value_metadata({{"min", "0"}, {"max", "10000000000"},
+                                             {"null_probability", "0.01"}})));
+  for (int i = 0; i < num_columns - 2; i++) {
+    std::stringstream ss;
+    ss << "col" << i;
+    fields.push_back(
+        field(ss.str(), float64(), /*nullable=*/true,
+              key_value_metadata(
+                  {{"min", "-1.e10"}, {"max", "1e10"}, {"null_probability", "0.05"}})));
+  }
+  auto batch = random::GenerateBatch(fields, num_rows, /*seed=*/42);
+  ARROW_ASSIGN_OR_RAISE(auto table, Table::FromRecordBatches({batch}));
+
+  ARROW_ASSIGN_OR_RAISE(auto sink, fs->OpenOutputStream(path));
+  RETURN_NOT_OK(parquet::arrow::WriteTable(*table, default_memory_pool(), sink,
+                                           /*chunk_size=*/num_rows));
+  return Status::OK();
+}
+
+/// Check if a path exists (used to skip re-creating test data on real Azure)
+static bool ObjectExists(AzureFileSystem* fs, const std::string& path) {
+  auto result = fs->GetFileInfo(path);
+  if (!result.ok()) return false;
+  return result->type() == FileType::File;
+}
+
+/// Ensure test data objects exist (creates only if missing)
+static Status EnsureTestData(AzureFileSystem* fs, const std::string& container) {
+  // Create container (idempotent — Azure returns success if it exists)
+  RETURN_NOT_OK(fs->CreateDir(container));
+
+  auto raw_1mib = container + "/raw_1mib";
+  auto raw_10mib = container + "/raw_10mib";
+  auto raw_100mib = container + "/raw_100mib";
+  auto pq_c20 = container + "/pq_c20_r100k";
+  auto pq_c100 = container + "/pq_c100_r50k";
+
+  if (!ObjectExists(fs, raw_1mib)) {
+    std::fprintf(stderr, "[bench] Creating %s ...\n", raw_1mib.c_str());
+    RETURN_NOT_OK(MakeRawObject(fs, raw_1mib, 1 * 1024 * 1024));
+  }
+  if (!ObjectExists(fs, raw_10mib)) {
+    std::fprintf(stderr, "[bench] Creating %s ...\n", raw_10mib.c_str());
+    RETURN_NOT_OK(MakeRawObject(fs, raw_10mib, 10 * 1024 * 1024));
+  }
+  if (!ObjectExists(fs, raw_100mib)) {
+    std::fprintf(stderr, "[bench] Creating %s ...\n", raw_100mib.c_str());
+    RETURN_NOT_OK(MakeRawObject(fs, raw_100mib, 100 * 1024 * 1024));
+  }
+  if (!ObjectExists(fs, pq_c20)) {
+    std::fprintf(stderr, "[bench] Creating %s ...\n", pq_c20.c_str());
+    RETURN_NOT_OK(MakeParquetObject(fs, pq_c20, 20, 100000));
+  }
+  if (!ObjectExists(fs, pq_c100)) {
+    std::fprintf(stderr, "[bench] Creating %s ...\n", pq_c100.c_str());
+    RETURN_NOT_OK(MakeParquetObject(fs, pq_c100, 100, 50000));
+  }
+  return Status::OK();
+}
+
+// ---------------------------------------------------------------------------
+// Azurite fixture: starts/stops Azurite for local benchmarks
 // ---------------------------------------------------------------------------
 
 class AzuriteFixture : public benchmark::Fixture {
  public:
-  void SetUp(const ::benchmark::State& state) override {
+  void SetUp(::benchmark::State& state) override {
+    if (IsRealAzureMode()) {
+      state.SkipWithMessage("Skipping Azurite tests in real Azure mode");
+      return;
+    }
     // Start Azurite process
     server_process_ = std::make_unique<util::Process>();
     ASSERT_OK(server_process_->SetExecutable("azurite"));
@@ -97,72 +218,82 @@ class AzuriteFixture : public benchmark::Fixture {
     options_.blob_storage_scheme = "http";
     options_.dfs_storage_scheme = "http";
 
+    container_ = "bench";
     ASSERT_OK_AND_ASSIGN(fs_, AzureFileSystem::Make(options_));
-
-    // Create the test container
-    ASSERT_OK(fs_->CreateDir("bench"));
-
-    // Pre-create test objects
-    ASSERT_OK(MakeRawObject("bench/raw_1mib", 1 * 1024 * 1024));
-    ASSERT_OK(MakeRawObject("bench/raw_10mib", 10 * 1024 * 1024));
-    ASSERT_OK(MakeRawObject("bench/raw_100mib", 100 * 1024 * 1024));
-    ASSERT_OK(MakeParquetObject("bench/pq_c20_r100k", 20, 100000));
-    ASSERT_OK(MakeParquetObject("bench/pq_c100_r50k", 100, 50000));
+    ASSERT_OK(EnsureTestData(fs_.get(), container_));
   }
 
-  void TearDown(const ::benchmark::State& state) override {
+  void TearDown(::benchmark::State& state) override {
     fs_.reset();
     if (server_process_) {
-      // Azurite is killed when the process object is destroyed
       server_process_.reset();
     }
     temp_dir_.reset();
   }
 
  protected:
-  /// Create a raw blob with deterministic data
-  Status MakeRawObject(const std::string& path, int64_t size) {
-    ARROW_ASSIGN_OR_RAISE(auto sink, fs_->OpenOutputStream(path));
-    // Write in 1 MiB chunks to avoid huge allocations
-    const int64_t chunk_size = 1024 * 1024;
-    std::string chunk(chunk_size, 'X');
-    int64_t remaining = size;
-    while (remaining > 0) {
-      int64_t to_write = std::min(remaining, chunk_size);
-      RETURN_NOT_OK(sink->Write(chunk.data(), to_write));
-      remaining -= to_write;
-    }
-    return sink->Close();
-  }
-
-  /// Create a Parquet file with mixed column types
-  Status MakeParquetObject(const std::string& path, int num_columns, int num_rows) {
-    FieldVector fields;
-    fields.push_back(field("id", int64(), /*nullable=*/false));
-    fields.push_back(field("timestamp", int64(), /*nullable=*/true,
-                           key_value_metadata({{"min", "0"}, {"max", "10000000000"},
-                                               {"null_probability", "0.01"}})));
-    for (int i = 0; i < num_columns - 2; i++) {
-      std::stringstream ss;
-      ss << "col" << i;
-      fields.push_back(
-          field(ss.str(), float64(), /*nullable=*/true,
-                key_value_metadata(
-                    {{"min", "-1.e10"}, {"max", "1e10"}, {"null_probability", "0.05"}})));
-    }
-    auto batch = random::GenerateBatch(fields, num_rows, /*seed=*/42);
-    ARROW_ASSIGN_OR_RAISE(auto table, Table::FromRecordBatches({batch}));
-
-    ARROW_ASSIGN_OR_RAISE(auto sink, fs_->OpenOutputStream(path));
-    RETURN_NOT_OK(parquet::arrow::WriteTable(*table, default_memory_pool(), sink,
-                                             /*chunk_size=*/num_rows));
-    return Status::OK();
-  }
-
   std::unique_ptr<util::Process> server_process_;
   std::unique_ptr<TemporaryDir> temp_dir_;
   AzureOptions options_;
   std::shared_ptr<AzureFileSystem> fs_;
+  std::string container_;
+};
+
+// ---------------------------------------------------------------------------
+// Real Azure fixture: connects to real Azure Blob Storage
+// ---------------------------------------------------------------------------
+
+class AzureBlobFixture : public benchmark::Fixture {
+ public:
+  void SetUp(::benchmark::State& state) override {
+    if (!IsRealAzureMode()) {
+      state.SkipWithMessage(
+          "Skipping real Azure tests (set AZURE_STORAGE_ACCOUNT + AZURE_STORAGE_KEY "
+          "or AZURE_STORAGE_CONNECTION_STRING)");
+      return;
+    }
+
+    auto conn_string = GetEnvOrEmpty("AZURE_STORAGE_CONNECTION_STRING");
+    auto account = GetEnvOrEmpty("AZURE_STORAGE_ACCOUNT");
+    auto key = GetEnvOrEmpty("AZURE_STORAGE_KEY");
+
+    if (!conn_string.empty()) {
+      // Parse connection string for account name
+      // Format: ...;AccountName=xxx;AccountKey=yyy;...
+      auto pos = conn_string.find("AccountName=");
+      if (pos != std::string::npos) {
+        auto start = pos + 12;
+        auto end = conn_string.find(';', start);
+        options_.account_name = conn_string.substr(start, end - start);
+      }
+      pos = conn_string.find("AccountKey=");
+      if (pos != std::string::npos) {
+        auto start = pos + 11;
+        auto end = conn_string.find(';', start);
+        auto account_key = conn_string.substr(start, end - start);
+        ASSERT_OK(options_.ConfigureAccountKeyCredential(account_key));
+      }
+    } else {
+      options_.account_name = account;
+      ASSERT_OK(options_.ConfigureAccountKeyCredential(key));
+    }
+
+    // Container name from env or default
+    container_ = GetEnvOrEmpty("AZURE_BENCH_CONTAINER");
+    if (container_.empty()) container_ = "arrowbench";
+
+    ASSERT_OK_AND_ASSIGN(fs_, AzureFileSystem::Make(options_));
+
+    // Ensure test data is present (skip re-creation if objects already exist)
+    ASSERT_OK(EnsureTestData(fs_.get(), container_));
+  }
+
+  void TearDown(::benchmark::State& state) override { fs_.reset(); }
+
+ protected:
+  AzureOptions options_;
+  std::shared_ptr<AzureFileSystem> fs_;
+  std::string container_;
 };
 
 // ---------------------------------------------------------------------------
@@ -171,8 +302,9 @@ class AzuriteFixture : public benchmark::Fixture {
 
 /// Write a blob using the configured block_upload_size
 static void WriteBlob(benchmark::State& st, AzureFileSystem* fs,
-                      const std::string& path, int64_t total_size,
+                      const std::string& container, int64_t total_size,
                       int64_t write_chunk_size) {
+  auto path = container + "/write_bench";
   int64_t total_bytes = 0;
   std::string chunk(write_chunk_size, 'W');
   for (auto _ : st) {
@@ -192,26 +324,6 @@ static void WriteBlob(benchmark::State& st, AzureFileSystem* fs,
       static_cast<double>(fs->options().block_upload_size) / (1024 * 1024);
 }
 
-BENCHMARK_DEFINE_F(AzuriteFixture, Write100MiB)(benchmark::State& st) {
-  WriteBlob(st, fs_.get(), "bench/write_100mib", 100 * 1024 * 1024,
-            /*write_chunk_size=*/4 * 1024 * 1024);
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, Write100MiB)->UseRealTime()->Unit(
-    benchmark::kMillisecond);
-
-BENCHMARK_DEFINE_F(AzuriteFixture, Write500MiB)(benchmark::State& st) {
-  WriteBlob(st, fs_.get(), "bench/write_500mib", 500 * 1024 * 1024,
-            /*write_chunk_size=*/4 * 1024 * 1024);
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, Write500MiB)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond)
-    ->Iterations(3);
-
-// ---------------------------------------------------------------------------
-// Read benchmarks: sequential full-file read
-// ---------------------------------------------------------------------------
-
 /// Read entire file in a single ReadAt call
 static void ReadNaive(benchmark::State& st, AzureFileSystem* fs,
                       const std::string& path) {
@@ -224,25 +336,6 @@ static void ReadNaive(benchmark::State& st, AzureFileSystem* fs,
   }
   st.SetBytesProcessed(total_bytes);
 }
-
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadNaive1MiB)(benchmark::State& st) {
-  ReadNaive(st, fs_.get(), "bench/raw_1mib");
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadNaive1MiB)->UseRealTime();
-
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadNaive10MiB)(benchmark::State& st) {
-  ReadNaive(st, fs_.get(), "bench/raw_10mib");
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadNaive10MiB)->UseRealTime();
-
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadNaive100MiB)(benchmark::State& st) {
-  ReadNaive(st, fs_.get(), "bench/raw_100mib");
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadNaive100MiB)->UseRealTime();
-
-// ---------------------------------------------------------------------------
-// Read benchmarks: chunked read (simulates column chunk reads)
-// ---------------------------------------------------------------------------
 
 static constexpr int64_t kReadChunkSize = 5 * 1024 * 1024;  // 5 MiB
 
@@ -263,15 +356,6 @@ static void ReadChunked(benchmark::State& st, AzureFileSystem* fs,
   }
   st.SetBytesProcessed(total_bytes);
 }
-
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadChunked100MiB)(benchmark::State& st) {
-  ReadChunked(st, fs_.get(), "bench/raw_100mib");
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadChunked100MiB)->UseRealTime();
-
-// ---------------------------------------------------------------------------
-// Read benchmarks: coalesced reads with different hole_size_limit
-// ---------------------------------------------------------------------------
 
 /// Read with I/O coalescing — measures benefit of larger hole_size_limit
 static void ReadCoalesced(benchmark::State& st, AzureFileSystem* fs,
@@ -308,34 +392,7 @@ static void ReadCoalesced(benchmark::State& st, AzureFileSystem* fs,
       static_cast<double>(100 * 1024 * 1024) / (kReadChunkSize + 512 * 1024);
 }
 
-/// Default coalescing (hole = 8 KiB) — baseline
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole8KiB)(benchmark::State& st) {
-  ReadCoalesced(st, fs_.get(), "bench/raw_100mib",
-                /*hole_size_limit=*/8192,
-                /*range_size_limit=*/32 * 1024 * 1024);
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole8KiB)->UseRealTime();
-
-/// Medium coalescing (hole = 1 MiB)
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole1MiB)(benchmark::State& st) {
-  ReadCoalesced(st, fs_.get(), "bench/raw_100mib",
-                /*hole_size_limit=*/1024 * 1024,
-                /*range_size_limit=*/64 * 1024 * 1024);
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole1MiB)->UseRealTime();
-
-/// Azure-optimized coalescing (hole = 12 MiB) — our recommendation
-BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole12MiB)(benchmark::State& st) {
-  ReadCoalesced(st, fs_.get(), "bench/raw_100mib",
-                /*hole_size_limit=*/12 * 1024 * 1024,
-                /*range_size_limit=*/64 * 1024 * 1024);
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole12MiB)->UseRealTime();
-
-// ---------------------------------------------------------------------------
-// Parquet read benchmarks: realistic end-to-end with coalescing
-// ---------------------------------------------------------------------------
-
+/// Parquet end-to-end read
 static void ParquetRead(benchmark::State& st, AzureFileSystem* fs,
                         const std::string& path, const std::vector<int>& column_indices,
                         bool pre_buffer, const io::CacheOptions& cache_options) {
@@ -361,80 +418,7 @@ static void ParquetRead(benchmark::State& st, AzureFileSystem* fs,
   st.SetBytesProcessed(total_bytes);
 }
 
-/// Parquet: read all columns with default CacheOptions (hole=8KiB, lazy)
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead20Col_DefaultCache)(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);
-  ParquetRead(st, fs_.get(), "bench/pq_c20_r100k", cols, /*pre_buffer=*/true,
-              io::CacheOptions::LazyDefaults());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead20Col_DefaultCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-/// Parquet: read all columns with Azure-optimized CacheOptions (hole=12MiB)
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead20Col_AzureCache)(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);
-  ParquetRead(st, fs_.get(), "bench/pq_c20_r100k", cols, /*pre_buffer=*/true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead20Col_AzureCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-/// Parquet: read sparse columns (every 10th) — worst case for small hole_size_limit
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Sparse_DefaultCache)
-(benchmark::State& st) {
-  std::vector<int> cols;
-  for (int i = 0; i < 100; i += 10) cols.push_back(i);
-  ParquetRead(st, fs_.get(), "bench/pq_c100_r50k", cols, /*pre_buffer=*/true,
-              io::CacheOptions::LazyDefaults());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Sparse_DefaultCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-/// Parquet: read sparse columns with Azure-optimized CacheOptions
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Sparse_AzureCache)
-(benchmark::State& st) {
-  std::vector<int> cols;
-  for (int i = 0; i < 100; i += 10) cols.push_back(i);
-  ParquetRead(st, fs_.get(), "bench/pq_c100_r50k", cols, /*pre_buffer=*/true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Sparse_AzureCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-/// Parquet: read contiguous columns with default cache — should coalesce even at 8KiB
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Contiguous_DefaultCache)
-(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);  // columns 0-19
-  ParquetRead(st, fs_.get(), "bench/pq_c100_r50k", cols, /*pre_buffer=*/true,
-              io::CacheOptions::LazyDefaults());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Contiguous_DefaultCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-/// Parquet: read contiguous columns with Azure-optimized cache
-BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Contiguous_AzureCache)
-(benchmark::State& st) {
-  std::vector<int> cols(20);
-  std::iota(cols.begin(), cols.end(), 0);  // columns 0-19
-  ParquetRead(st, fs_.get(), "bench/pq_c100_r50k", cols, /*pre_buffer=*/true,
-              AzureOptions::RecommendedCacheOptions());
-}
-BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Contiguous_AzureCache)
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
-
-// ---------------------------------------------------------------------------
-// Parquet write benchmarks: Parquet file creation throughput
-// ---------------------------------------------------------------------------
-
+/// Parquet write
 static void ParquetWrite(benchmark::State& st, AzureFileSystem* fs,
                          const std::string& path, int num_columns, int num_rows,
                          parquet::Compression::type compression) {
@@ -468,30 +452,322 @@ static void ParquetWrite(benchmark::State& st, AzureFileSystem* fs,
       static_cast<double>(fs->options().block_upload_size) / (1024 * 1024);
 }
 
-/// Write Parquet with SNAPPY (20 columns, 250K rows ≈ 40 MiB)
+// ---------------------------------------------------------------------------
+// Macro: define + register the same benchmark for both Azurite and AzureBlob
+// ---------------------------------------------------------------------------
+
+// Azurite (local) benchmarks
+
+BENCHMARK_DEFINE_F(AzuriteFixture, Write100MiB)(benchmark::State& st) {
+  WriteBlob(st, fs_.get(), container_, 100LL * 1024 * 1024, 4 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, Write100MiB)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(AzuriteFixture, Write500MiB)(benchmark::State& st) {
+  WriteBlob(st, fs_.get(), container_, 500LL * 1024 * 1024, 4 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, Write500MiB)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ReadNaive1MiB)(benchmark::State& st) {
+  ReadNaive(st, fs_.get(), container_ + "/raw_1mib");
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ReadNaive1MiB)->UseRealTime();
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ReadNaive10MiB)(benchmark::State& st) {
+  ReadNaive(st, fs_.get(), container_ + "/raw_10mib");
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ReadNaive10MiB)->UseRealTime();
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ReadNaive100MiB)(benchmark::State& st) {
+  ReadNaive(st, fs_.get(), container_ + "/raw_100mib");
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ReadNaive100MiB)->UseRealTime();
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ReadChunked100MiB)(benchmark::State& st) {
+  ReadChunked(st, fs_.get(), container_ + "/raw_100mib");
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ReadChunked100MiB)->UseRealTime();
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole8KiB)(benchmark::State& st) {
+  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 8192, 32 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole8KiB)->UseRealTime();
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole1MiB)(benchmark::State& st) {
+  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 1024 * 1024,
+                64 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole1MiB)->UseRealTime();
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ReadCoalesced100MiB_Hole12MiB)(benchmark::State& st) {
+  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 12 * 1024 * 1024,
+                64 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ReadCoalesced100MiB_Hole12MiB)->UseRealTime();
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead20Col_DefaultCache)(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c20_r100k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead20Col_DefaultCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead20Col_AzureCache)(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c20_r100k", cols, true,
+              AzureOptions::RecommendedCacheOptions());
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead20Col_AzureCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Sparse_DefaultCache)
+(benchmark::State& st) {
+  std::vector<int> cols;
+  for (int i = 0; i < 100; i += 10) cols.push_back(i);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Sparse_DefaultCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Sparse_AzureCache)
+(benchmark::State& st) {
+  std::vector<int> cols;
+  for (int i = 0; i < 100; i += 10) cols.push_back(i);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              AzureOptions::RecommendedCacheOptions());
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Sparse_AzureCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Contiguous_DefaultCache)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Contiguous_DefaultCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(AzuriteFixture, ParquetRead100Col_Contiguous_AzureCache)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              AzureOptions::RecommendedCacheOptions());
+}
+BENCHMARK_REGISTER_F(AzuriteFixture, ParquetRead100Col_Contiguous_AzureCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
 BENCHMARK_DEFINE_F(AzuriteFixture, ParquetWrite20Col_Snappy)(benchmark::State& st) {
-  ParquetWrite(st, fs_.get(), "bench/pq_write_snappy", 20, 250000,
+  ParquetWrite(st, fs_.get(), container_ + "/pq_write_snappy", 20, 250000,
                parquet::Compression::SNAPPY);
 }
 BENCHMARK_REGISTER_F(AzuriteFixture, ParquetWrite20Col_Snappy)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
-/// Write Parquet with ZSTD (20 columns, 250K rows ≈ 30 MiB)
 BENCHMARK_DEFINE_F(AzuriteFixture, ParquetWrite20Col_Zstd)(benchmark::State& st) {
-  ParquetWrite(st, fs_.get(), "bench/pq_write_zstd", 20, 250000,
+  ParquetWrite(st, fs_.get(), container_ + "/pq_write_zstd", 20, 250000,
                parquet::Compression::ZSTD);
 }
 BENCHMARK_REGISTER_F(AzuriteFixture, ParquetWrite20Col_Zstd)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
-/// Write Parquet with SNAPPY (100 columns, 100K rows ≈ 80 MiB)
 BENCHMARK_DEFINE_F(AzuriteFixture, ParquetWrite100Col_Snappy)(benchmark::State& st) {
-  ParquetWrite(st, fs_.get(), "bench/pq_write_100col_snappy", 100, 100000,
+  ParquetWrite(st, fs_.get(), container_ + "/pq_write_100col_snappy", 100, 100000,
                parquet::Compression::SNAPPY);
 }
 BENCHMARK_REGISTER_F(AzuriteFixture, ParquetWrite100Col_Snappy)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+// ---------------------------------------------------------------------------
+// Real Azure benchmarks (same tests, AzureBlobFixture)
+// ---------------------------------------------------------------------------
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, Write100MiB)(benchmark::State& st) {
+  WriteBlob(st, fs_.get(), container_, 100LL * 1024 * 1024, 4 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Write100MiB)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, Write500MiB)(benchmark::State& st) {
+  WriteBlob(st, fs_.get(), container_, 500LL * 1024 * 1024, 4 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, Write500MiB)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ReadNaive1MiB)(benchmark::State& st) {
+  ReadNaive(st, fs_.get(), container_ + "/raw_1mib");
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ReadNaive1MiB)
+    ->UseRealTime()
+    ->Iterations(10);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ReadNaive10MiB)(benchmark::State& st) {
+  ReadNaive(st, fs_.get(), container_ + "/raw_10mib");
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ReadNaive10MiB)
+    ->UseRealTime()
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ReadNaive100MiB)(benchmark::State& st) {
+  ReadNaive(st, fs_.get(), container_ + "/raw_100mib");
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ReadNaive100MiB)
+    ->UseRealTime()
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ReadChunked100MiB)(benchmark::State& st) {
+  ReadChunked(st, fs_.get(), container_ + "/raw_100mib");
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ReadChunked100MiB)
+    ->UseRealTime()
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ReadCoalesced100MiB_Hole8KiB)
+(benchmark::State& st) {
+  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 8192, 32 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ReadCoalesced100MiB_Hole8KiB)
+    ->UseRealTime()
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ReadCoalesced100MiB_Hole1MiB)
+(benchmark::State& st) {
+  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 1024 * 1024,
+                64 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ReadCoalesced100MiB_Hole1MiB)
+    ->UseRealTime()
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ReadCoalesced100MiB_Hole12MiB)
+(benchmark::State& st) {
+  ReadCoalesced(st, fs_.get(), container_ + "/raw_100mib", 12 * 1024 * 1024,
+                64 * 1024 * 1024);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ReadCoalesced100MiB_Hole12MiB)
+    ->UseRealTime()
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead20Col_DefaultCache)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c20_r100k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead20Col_DefaultCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead20Col_AzureCache)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c20_r100k", cols, true,
+              AzureOptions::RecommendedCacheOptions());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead20Col_AzureCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Sparse_DefaultCache)
+(benchmark::State& st) {
+  std::vector<int> cols;
+  for (int i = 0; i < 100; i += 10) cols.push_back(i);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Sparse_DefaultCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Sparse_AzureCache)
+(benchmark::State& st) {
+  std::vector<int> cols;
+  for (int i = 0; i < 100; i += 10) cols.push_back(i);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              AzureOptions::RecommendedCacheOptions());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Sparse_AzureCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Contiguous_DefaultCache)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              io::CacheOptions::LazyDefaults());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Contiguous_DefaultCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetRead100Col_Contiguous_AzureCache)
+(benchmark::State& st) {
+  std::vector<int> cols(20);
+  std::iota(cols.begin(), cols.end(), 0);
+  ParquetRead(st, fs_.get(), container_ + "/pq_c100_r50k", cols, true,
+              AzureOptions::RecommendedCacheOptions());
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetRead100Col_Contiguous_AzureCache)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetWrite20Col_Snappy)(benchmark::State& st) {
+  ParquetWrite(st, fs_.get(), container_ + "/pq_write_snappy", 20, 250000,
+               parquet::Compression::SNAPPY);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetWrite20Col_Snappy)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetWrite20Col_Zstd)(benchmark::State& st) {
+  ParquetWrite(st, fs_.get(), container_ + "/pq_write_zstd", 20, 250000,
+               parquet::Compression::ZSTD);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetWrite20Col_Zstd)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(3);
+
+BENCHMARK_DEFINE_F(AzureBlobFixture, ParquetWrite100Col_Snappy)(benchmark::State& st) {
+  ParquetWrite(st, fs_.get(), container_ + "/pq_write_100col_snappy", 100, 100000,
+               parquet::Compression::SNAPPY);
+}
+BENCHMARK_REGISTER_F(AzureBlobFixture, ParquetWrite100Col_Snappy)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond)
     ->Iterations(3);
